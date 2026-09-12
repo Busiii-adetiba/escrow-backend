@@ -1,6 +1,7 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
+import { autoAuth, TEST_API_KEY } from "./helpers/api-key-helper.js";
 import {
   resetJobWhitelistRateLimitBuckets,
   resetWhitelistUpdateRateLimitBuckets,
@@ -44,6 +45,7 @@ const { default: router, resetWhitelistCache } = await import(
 function buildApp() {
   const app = express();
   app.use(express.json());
+  app.use(autoAuth);
   app.use("/api/jobs", router);
   return app;
 }
@@ -59,7 +61,6 @@ describe("POST /api/jobs/:contractId/whitelist/update", () => {
     resetWhitelistUpdateRateLimitBuckets();
     resetWhitelistCache();
 
-    delete process.env.API_KEY;
     delete process.env.JOB_WHITELIST_RATE_MAX;
     delete process.env.JOB_WHITELIST_RATE_WINDOW_MS;
     delete process.env.JOB_WHITELIST_UPDATE_RATE_MAX;
@@ -247,6 +248,20 @@ describe("POST /api/jobs/:contractId/whitelist/update", () => {
       const res = await request(buildApp())
         .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
         .set("x-api-key", "wrong-key")
+        .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
+        .expect(401);
+
+      expect(res.body).toEqual({
+        success: false,
+        error: "Unauthorized",
+      });
+    });
+
+    it("returns 401 (fails closed) when API_KEY is not set", async () => {
+      delete process.env.API_KEY;
+
+      const res = await request(buildApp())
+        .post(`/api/jobs/${VALID_CONTRACT}/whitelist/update`)
         .send({ addresses: [VALID_STELLAR_ADDRESS_1] })
         .expect(401);
 

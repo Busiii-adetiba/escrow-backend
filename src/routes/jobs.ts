@@ -321,6 +321,43 @@ const parseJobFromResult = (result: any, contractId: string) => {
 // the client, freelancer, or arbiter.
 // Query params: ?page=1&limit=10
 // ---------------------------------------------------------------------------
+/**
+ * Shared API-key gate for the job routes below.
+ *
+ * Fails CLOSED. When API_KEY is unset the request is rejected rather than
+ * waved through, mirroring requireAdmin() in ../middleware/adminAuth.ts.
+ *
+ * The previous form of this check was `if (requiredApiKey) { ... }`, which
+ * skipped authentication entirely whenever the variable was missing — so a
+ * deployment that forgot to set API_KEY silently served these endpoints to
+ * anyone, with nothing in the logs to say so.
+ *
+ * Returns true when the caller is authorised. When it returns false the 401
+ * has already been sent and the caller must return immediately.
+ */
+function ensureApiKey(
+  req: Request,
+  res: Response,
+  logMessage: string,
+  logContext: Record<string, unknown>,
+): boolean {
+  const requiredApiKey = process.env.API_KEY;
+  if (!requiredApiKey) {
+    logger.error("API_KEY is not configured - refusing request", logContext);
+    sendError(res, 401, "Unauthorized");
+    return false;
+  }
+
+  const providedKey = req.header("x-api-key");
+  if (!providedKey || providedKey !== requiredApiKey) {
+    logger.warn(logMessage, logContext);
+    sendError(res, 401, "Unauthorized");
+    return false;
+  }
+
+  return true;
+}
+
 router.options("/by-wallet/:address", byWalletCors);
 
 router.get(
@@ -336,16 +373,7 @@ router.get(
   async (req: Request, res: Response) => {
     const address = req.params.address as string;
 
-    // Optional API-key gate (same pattern as GET /:contractId)
-    const requiredApiKey = process.env.API_KEY;
-    if (requiredApiKey) {
-      const providedKey = req.header("x-api-key");
-      if (providedKey !== requiredApiKey) {
-        logger.warn("Unauthorized by-wallet request", { address });
-        sendError(res, 401, "Unauthorized");
-        return;
-      }
-    }
+    if (!ensureApiKey(req, res, "Unauthorized by-wallet request", { address })) return;
 
     try {
       const { page, limit } = (req as RequestWithValidatedQuery)
@@ -508,15 +536,7 @@ router.get(
 
     logger.info("Fetching job", { contractId });
 
-    const requiredApiKey = process.env.API_KEY;
-    if (requiredApiKey) {
-      const providedKey = req.header("x-api-key");
-      if (providedKey !== requiredApiKey) {
-        logger.warn("Unauthorized request", { contractId });
-        sendError(res, 401, "Unauthorized");
-        return;
-      }
-    }
+    if (!ensureApiKey(req, res, "Unauthorized request", { contractId })) return;
 
     try {
       const contract = new Contract(contractId);
@@ -586,16 +606,7 @@ router.get(
     const contractId = req.params.contractId as string;
 
     try {
-      // Check API key authorization
-      const requiredApiKey = process.env.API_KEY;
-      if (requiredApiKey) {
-        const providedKey = req.header("x-api-key");
-        if (providedKey !== requiredApiKey) {
-          logger.warn("Unauthorized request", { contractId });
-          sendError(res, 401, "Unauthorized");
-          return;
-        }
-      }
+      if (!ensureApiKey(req, res, "Unauthorized request", { contractId })) return;
 
       // Check cache
       const cached = whitelistCache.get<string[]>(contractId);
@@ -733,15 +744,7 @@ router.post(
 
     logger.info("Updating whitelist", { contractId, count: targetAddresses.length });
 
-    const requiredApiKey = process.env.API_KEY;
-    if (requiredApiKey) {
-      const providedKey = req.header("x-api-key");
-      if (providedKey !== requiredApiKey) {
-        logger.warn("Unauthorized request for whitelist update", { contractId });
-        sendError(res, 401, "Unauthorized");
-        return;
-      }
-    }
+    if (!ensureApiKey(req, res, "Unauthorized request for whitelist update", { contractId })) return;
 
     // The single-token form (`{ token, action, adminAddress }`) builds and
     // returns an unsigned transaction for the caller to sign, rather than
@@ -1140,15 +1143,7 @@ router.post(
     try {
       const { contractId, index } = req.params;
 
-      const requiredApiKey = process.env.API_KEY;
-      if (requiredApiKey) {
-        const providedKey = req.header("x-api-key");
-        if (providedKey !== requiredApiKey) {
-          logger.warn("Unauthorized request", { traceId, contractId, index });
-          sendError(res, 401, "Unauthorized");
-          return;
-        }
-      }
+      if (!ensureApiKey(req, res, "Unauthorized request", { traceId, contractId, index })) return;
 
       const { amount, sourceAddress } = req.body;
 
@@ -1301,15 +1296,7 @@ router.get(
     const contractId = req.params.contractId as string;
     const { index } = req.params;
 
-    const requiredApiKey = process.env.API_KEY;
-    if (requiredApiKey) {
-      const providedKey = req.header("x-api-key");
-      if (providedKey !== requiredApiKey) {
-        logger.warn("Unauthorized request", { contractId, index });
-        sendError(res, 401, "Unauthorized");
-        return;
-      }
-    }
+    if (!ensureApiKey(req, res, "Unauthorized request", { contractId, index })) return;
 
     const cacheKey = `${contractId}:${index}`;
 

@@ -1,6 +1,7 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
+import { autoAuth, TEST_API_KEY } from "./helpers/api-key-helper.js";
 
 const VALID_CONTRACT = "CDD5WKK3WT3QVKXMXTJNDIXE4T73FK6GGXDSD6UTJAH6YYZU52SQ4MUH";
 const VALID_ADDRESS = "GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX";
@@ -23,6 +24,7 @@ const { resetPartialReleaseRateLimitBuckets } = await import(
 function buildApp() {
   const app = express();
   app.use(express.json());
+  app.use(autoAuth);
   app.use("/api/jobs", router);
   return app;
 }
@@ -411,13 +413,13 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
       expect(res.body.success).toBe(true);
     });
 
-    it("returns 200 (no gate) when API_KEY is not set", async () => {
+    it("returns 401 (fails closed) when API_KEY is not set", async () => {
       delete process.env.API_KEY;
       const res = await request(buildApp())
         .post(ENDPOINT)
         .send(VALID_BODY)
-        .expect(200);
-      expect(res.body.success).toBe(true);
+        .expect(401);
+      expect(res.body).toEqual({ success: false, error: "Unauthorized" });
     });
   });
 
