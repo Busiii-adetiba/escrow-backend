@@ -52,7 +52,7 @@ jobs:
           push: true
           # Must match your EC2 instance architecture.
           # t3.* = linux/amd64. t4g.* (Graviton) = linux/arm64.
-          platforms: linux/amd64
+          platforms: linux/arm64
           tags: |
             ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
           cache-from: type=gha
