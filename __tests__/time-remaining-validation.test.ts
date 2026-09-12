@@ -1,6 +1,7 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
+import { autoAuth, TEST_API_KEY } from "./helpers/api-key-helper.js";
 
 const VALID_CONTRACT = "CDD5WKK3WT3QVKXMXTJNDIXE4T73FK6GGXDSD6UTJAH6YYZU52SQ4MUH";
 
@@ -22,6 +23,7 @@ const { resetTimeRemainingRateLimitBuckets } = await import(
 function buildApp() {
   const app = express();
   app.use(express.json());
+  app.use(autoAuth);
   app.use("/api/jobs", router);
   return app;
 }
@@ -54,6 +56,17 @@ describe("GET /api/jobs/:contractId/milestones/:index/time-remaining", () => {
     expect(res.body).toEqual({ success: true, data: { secondsRemaining: 120 } });
     expect(mockGetAccount).toHaveBeenCalled();
     expect(mockSimulateTransaction).toHaveBeenCalled();
+  });
+
+  it("returns 401 (fails closed) when API_KEY is not set", async () => {
+    delete process.env.API_KEY;
+
+    const res = await request(buildApp())
+      .get(`/api/jobs/${VALID_CONTRACT}/milestones/0/time-remaining`)
+      .expect(401);
+
+    expect(res.body).toEqual({ success: false, error: "Unauthorized" });
+    expect(mockSimulateTransaction).not.toHaveBeenCalled();
   });
 
   // 2. Invalid contractId

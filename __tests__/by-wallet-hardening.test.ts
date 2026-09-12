@@ -1,6 +1,7 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
+import { autoAuth, TEST_API_KEY } from "./helpers/api-key-helper.js";
 import { resetByWalletRateLimitBuckets, walletLookupLimiter } from "../src/middleware/rateLimiter.js";
 
 const mockGetJobsByWallet = jest.fn();
@@ -26,6 +27,7 @@ const { default: router } = await import("../src/routes/jobs.js");
 function buildApp() {
   const app = express();
   app.use(express.json());
+  app.use(autoAuth);
   app.use("/api/jobs", router);
   return app;
 }

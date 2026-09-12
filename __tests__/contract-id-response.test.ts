@@ -1,6 +1,7 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
+import { autoAuth, TEST_API_KEY } from "./helpers/api-key-helper.js";
 import logger from "../src/utils/logger.js";
 
 const VALID_CONTRACT =
@@ -21,6 +22,7 @@ const { default: router } = await import("../src/routes/jobs.js");
 function buildApp() {
   const app = express();
   app.use(express.json());
+  app.use(autoAuth);
   app.use("/api/jobs", router);
   return app;
 }
@@ -31,7 +33,6 @@ describe("GET /api/jobs/:contractId – response format and status codes", () =>
   beforeEach(() => {
     mockGetAccount.mockReset();
     mockSimulateTransaction.mockReset();
-    delete process.env.API_KEY;
     mockGetAccount.mockResolvedValue({
       accountId: () =>
         "GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX",
@@ -83,6 +84,17 @@ describe("GET /api/jobs/:contractId – response format and status codes", () =>
       .expect(401);
 
     expect(res.body).toEqual({ success: false, error: "Unauthorized" });
+  });
+
+  it("returns 401 (fails closed) when API_KEY is not set", async () => {
+    delete process.env.API_KEY;
+
+    const res = await request(buildApp())
+      .get(`/api/jobs/${VALID_CONTRACT}`)
+      .expect(401);
+
+    expect(res.body).toEqual({ success: false, error: "Unauthorized" });
+    expect(mockGetAccount).not.toHaveBeenCalled();
   });
 
   it("returns 404 when simulation reports the job was not found", async () => {
@@ -173,7 +185,6 @@ describe("GET /api/jobs/:contractId – logging traces", () => {
   const origApiKey = process.env.API_KEY;
 
   beforeEach(() => {
-    delete process.env.API_KEY;
     mockGetAccount.mockReset();
     mockSimulateTransaction.mockReset();
     mockGetAccount.mockResolvedValue({

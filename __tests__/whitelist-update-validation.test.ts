@@ -5,6 +5,7 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
+import { autoAuth, TEST_API_KEY } from "./helpers/api-key-helper.js";
 import {
   resetJobWhitelistRateLimitBuckets,
   resetWhitelistUpdateRateLimitBuckets,
@@ -46,6 +47,7 @@ const { default: router, resetWhitelistCache } = await import("../src/routes/job
 function buildApp() {
   const app = express();
   app.use(express.json());
+  app.use(autoAuth);
   app.use("/api/jobs", router);
   return app;
 }
@@ -75,7 +77,6 @@ describe("POST /api/jobs/:contractId/whitelist/update – schema validation", ()
     // whitelist-update.test.ts.
     resetWhitelistUpdateRateLimitBuckets();
     resetWhitelistCache();
-    delete process.env.API_KEY;
 
     // Default happy-path mock: return a minimal account and a stub XDR
     mockGetAccount.mockResolvedValue({

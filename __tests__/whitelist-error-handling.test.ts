@@ -1,6 +1,7 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
+import { autoAuth, TEST_API_KEY } from "./helpers/api-key-helper.js";
 import { resetJobWhitelistRateLimitBuckets } from "../src/middleware/job-contract-rate-limit.js";
 
 const VALID_CONTRACT =
@@ -33,6 +34,7 @@ const { default: router, resetWhitelistCache } = await import("../src/routes/job
 function buildApp() {
   const app = express();
   app.use(express.json());
+  app.use(autoAuth);
   app.use("/api/jobs", router);
   return app;
 }
@@ -47,7 +49,6 @@ describe("GET /api/jobs/:contractId/whitelist – Robust Error Handling (Issue #
     resetJobWhitelistRateLimitBuckets();
     resetWhitelistCache();
 
-    delete process.env.API_KEY;
     delete process.env.JOB_WHITELIST_RATE_MAX;
     delete process.env.JOB_WHITELIST_RATE_WINDOW_MS;
     delete process.env.ALLOWED_ORIGINS;
@@ -514,7 +515,7 @@ describe("GET /api/jobs/:contractId/whitelist – Robust Error Handling (Issue #
       for (const scenario of scenarios) {
         mockSimulateTransaction.mockReset();
         mockLoggerError.mockReset();
-        delete process.env.API_KEY;
+        process.env.API_KEY = TEST_API_KEY;
         scenario.setup();
 
         const res = await request(buildApp())
