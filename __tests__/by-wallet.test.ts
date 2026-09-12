@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import request from "supertest";
 import express from "express";
+import { autoAuth, TEST_API_KEY } from "./helpers/api-key-helper.js";
 import type { Request, Response } from "express";
 import { resetByWalletRateLimitBuckets } from "../src/middleware/rateLimiter.js";
 import {
@@ -317,9 +318,8 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
     // Dynamically import the router AFTER setDb() so it uses the in-memory DB
     const { default: router } = await import("../src/routes/jobs.js");
     app = express();
-    // Ensure no API_KEY gate is active for the baseline HTTP suite
-    delete process.env.API_KEY;
     app.use(express.json());
+    app.use(autoAuth);
     app.use("/api/jobs", router);
   });
 
@@ -430,6 +430,7 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
     const { default: router } = await import("../src/routes/jobs.js");
     app = express();
     app.use(express.json());
+    app.use(autoAuth);
     app.use("/api/jobs", router);
   });
 
@@ -549,11 +550,11 @@ describe("GET /api/jobs/by-wallet/:address – status codes", () => {
     const { default: router } = await import("../src/routes/jobs.js");
     app = express();
     app.use(express.json());
+    app.use(autoAuth);
     app.use("/api/jobs", router);
   });
 
   afterEach(() => {
-    delete process.env.API_KEY;
     resetJobsByWalletCache();
   });
 
@@ -669,14 +670,14 @@ describe("GET /api/jobs/by-wallet/:address – status codes", () => {
     expect(res.body.success).toBe(true);
   });
 
-  it("returns 200 (no gate) when API_KEY env var is not set", async () => {
+  it("returns 401 (fails closed) when API_KEY env var is not set", async () => {
     delete process.env.API_KEY;
 
     const res = await request(app)
       .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
-      .expect(200);
+      .expect(401);
 
-    expect(res.body.success).toBe(true);
+    expect(res.body).toEqual({ success: false, error: "Unauthorized" });
   });
 
   // -------------------------------------------------------------------------
