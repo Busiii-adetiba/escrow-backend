@@ -1,5 +1,6 @@
 import type { Server } from "@stellar/stellar-sdk/rpc";
 import logger from "../utils/logger.js";
+import { formatError } from "../utils/format-error.js";
 
 /**
  * The set of Soroban contract event types the indexer cares about.
@@ -109,8 +110,8 @@ const defaultSleep = (ms: number): Promise<void> =>
  * Fetch filtered contract events from the Soroban RPC with exponential-backoff
  * retry on transient connection errors.
  *
- * Only the event types listed in `EVENT_TYPES` are requested, so irrelevant
- * contract events are never returned to the caller.
+ * All topics are currently requested (wildcard filter) — see the comment on
+ * `topics` below for why the `EVENT_TYPES` filter was removed.
  *
  * On each connection failure the wait before the next attempt doubles, starting
  * at `initialBackoffMs` and never exceeding `MAX_BACKOFF_MS`.  Non-connection
@@ -143,7 +144,17 @@ export async function fetchEventsWithRetry(
           {
             type: "contract",
             contractIds: params.contractIds,
-            topics: [[...EVENT_TYPES]],
+            // Match every topic. Soroban RPC requires each topic segment to
+            // be either the wildcard "*" or a base64-encoded XDR ScVal. The
+            // previous value sent EVENT_TYPES' raw ASCII strings, which are
+            // neither, so getEvents rejected every poll since first deploy.
+            //
+            // The wildcard is a deliberate, temporary choice. Rebuilding a
+            // real type filter is tracked separately and blocked on
+            // confirming the actual topic[0] values the contract emits;
+            // EVENT_TYPES is not re-encoded as ScVal symbols here because
+            // those ten strings are not yet known to be correct.
+            topics: [["*"]],
           },
         ],
         limit: params.limit ?? 100,
@@ -164,7 +175,7 @@ export async function fetchEventsWithRetry(
       if (!isConnectionError(err)) {
         logger.error("event_type_filter: non-connection error from getEvents", {
           attempt,
-          error: err instanceof Error ? err.message : String(err),
+          error: formatError(err),
         });
         throw err;
       }
@@ -177,7 +188,7 @@ export async function fetchEventsWithRetry(
           {
             maxAttempts,
             startLedger: params.startLedger,
-            error: err instanceof Error ? err.message : String(err),
+            error: formatError(err),
           }
         );
         break;
@@ -189,7 +200,7 @@ export async function fetchEventsWithRetry(
           attempt,
           attemptsLeft,
           backoffMs,
-          error: err instanceof Error ? err.message : String(err),
+          error: formatError(err),
         }
       );
 

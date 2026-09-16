@@ -21,6 +21,7 @@ import {
 } from "./indexer_runner.js";
 import { deliverWebhooks } from "./webhook-delivery.js";
 import { fetchEventsWithRetry } from "./event_type_filter.js";
+import { formatError } from "../utils/format-error.js";
 import logger from "../utils/logger.js";
 
 const RPC_URL =
@@ -516,7 +517,7 @@ export async function pollEvents(): Promise<boolean> {
 
     deliverWebhooks(startLedger, currentLedger).catch((err) =>
       logger.error("Error delivering webhooks", {
-        error: err instanceof Error ? err.message : String(err),
+        error: formatError(err),
       })
     );
 
@@ -524,12 +525,12 @@ export async function pollEvents(): Promise<boolean> {
   } catch (err) {
     const totalElapsed = performance.now() - pollStart;
     const consecutiveFailures = failureMonitor.recordFailure("poll", {
-      error: err instanceof Error ? err.message : String(err),
+      error: formatError(err),
       operation: "poll_events",
     });
 
     logger.error("Error polling events", {
-      error: err instanceof Error ? err.message : String(err),
+      error: formatError(err),
       consecutiveFailures,
       elapsedMs: Math.round(totalElapsed),
     });

@@ -204,7 +204,7 @@ describe("fetchEventsWithRetry – success path", () => {
     expect(server.getEvents).toHaveBeenCalledTimes(1);
   });
 
-  it("passes EVENT_TYPES as the topic filter", async () => {
+  it("sends a wildcard topic filter, not EVENT_TYPES", async () => {
     const server = makeSuccessServer();
 
     await fetchEventsWithRetry(server, BASE_PARAMS, { sleep: noopSleep });
@@ -212,7 +212,29 @@ describe("fetchEventsWithRetry – success path", () => {
     const callArgs = server.getEvents.mock.calls[0][0] as unknown as {
       filters: Array<{ topics: string[][] }>;
     };
-    expect(callArgs.filters[0].topics[0]).toEqual([...EVENT_TYPES]);
+
+    // Soroban RPC only accepts "*" or a base64 XDR ScVal per topic segment.
+    expect(callArgs.filters[0].topics).toEqual([["*"]]);
+
+    // Guard against a regression to the raw-ASCII filter that made getEvents
+    // reject every poll: the bare strings must not reappear in the request.
+    expect(callArgs.filters[0].topics[0]).not.toEqual([...EVENT_TYPES]);
+    for (const eventType of EVENT_TYPES) {
+      expect(callArgs.filters[0].topics.flat()).not.toContain(eventType);
+    }
+  });
+
+  it("still sends type 'contract' and the caller's contractIds", async () => {
+    const server = makeSuccessServer();
+
+    await fetchEventsWithRetry(server, BASE_PARAMS, { sleep: noopSleep });
+
+    const callArgs = server.getEvents.mock.calls[0][0] as unknown as {
+      filters: Array<{ type: string; contractIds: string[] }>;
+    };
+    expect(callArgs.filters).toHaveLength(1);
+    expect(callArgs.filters[0].type).toBe("contract");
+    expect(callArgs.filters[0].contractIds).toEqual(BASE_PARAMS.contractIds);
   });
 
   it("passes contractIds and startLedger from params", async () => {
