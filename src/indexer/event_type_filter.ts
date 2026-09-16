@@ -147,13 +147,35 @@ export async function fetchEventsWithRetry(
             // Match every topic. Soroban RPC requires each topic segment to
             // be either the wildcard "*" or a base64-encoded XDR ScVal. The
             // previous value sent EVENT_TYPES' raw ASCII strings, which are
-            // neither, so getEvents rejected every poll since first deploy.
+            // neither, so getEvents rejected every poll since first deploy
+            // with -32602 "invalid parameters ... illegal base64 data".
             //
-            // The wildcard is a deliberate, temporary choice. Rebuilding a
-            // real type filter is tracked separately and blocked on
-            // confirming the actual topic[0] values the contract emits;
-            // EVENT_TYPES is not re-encoded as ScVal symbols here because
-            // those ten strings are not yet known to be correct.
+            // The wildcard is the correct, permanent choice — not a
+            // placeholder pending a narrower filter. Do not replace it with
+            // an enumerated topic filter: that migration is structurally
+            // impossible, for two independent reasons.
+            //
+            //   1. It does not fit. The contract emits 52 distinct topic[0]
+            //      discriminators (the symbol_short! literals across
+            //      milestone-escrow/src/lib.rs). Soroban RPC caps filters at
+            //      5 topics per filter and 5 filters per request — 25
+            //      alternatives maximum. 52 cannot be expressed, neither as
+            //      one filter nor split across filters. Exceeding either cap
+            //      is a hard -32602: "maximum 5 topics per filter" and
+            //      "maximum 5 filters per request" respectively.
+            //
+            //   2. It would buy nothing. contractIds already scopes every
+            //      request to our own contract, and we want all 52 of the
+            //      event types that contract emits. Enumerating them would
+            //      be semantically identical to sending no topic filter at
+            //      all — just fighting the 25-item cap to arrive back here.
+            //
+            // Note also that EVENT_TYPES' ten strings are not those
+            // discriminators: none of the ten matches any symbol the
+            // contract emits, and several exceed symbol_short!'s 9-character
+            // limit, so they could never have been emitted. EVENT_TYPES is
+            // retained for its EventType alias and is deliberately not used
+            // to build this request.
             topics: [["*"]],
           },
         ],
