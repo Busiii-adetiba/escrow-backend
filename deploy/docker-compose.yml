@@ -22,7 +22,14 @@ services:
       # GET /health is registered before the rate limiter, so frequent
       # probing won't trip it. Note it's liveness only — it returns ok
       # even if SQLite is broken or the poller has died.
-      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3001/health"]
+      #
+      # Probe with node, not wget: node:20-bookworm-slim ships neither wget
+      # nor curl, so a wget probe exits 127 (command not found) and Compose
+      # reports the container unhealthy however healthy the app is. This
+      # healthcheck also overrides the image's own HEALTHCHECK, so fixing
+      # the Dockerfile alone would not have changed the reported status.
+      test: ["CMD", "node", "-e",
+        "fetch('http://127.0.0.1:3001/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3
