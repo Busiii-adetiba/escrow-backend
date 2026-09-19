@@ -49,15 +49,15 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
-      # - "443:443"             # uncomment at the TLS checkpoint
+      - "443:443"
     depends_on:
       backend:
         condition: service_started   # not service_healthy — nginx should
                                      # still serve pages when the API is down
     networks:
       - escrow
-    # volumes:
-    #   - /etc/letsencrypt:/etc/letsencrypt:ro
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt:ro
     logging:
       driver: json-file
       options:
