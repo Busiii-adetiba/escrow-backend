@@ -225,9 +225,15 @@ export async function recordNodeHealth(
     write(status);
     return true;
   } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error("Failed to record node health", {
       nodeUrl: status.nodeUrl,
-      error: err instanceof Error ? err.message : String(err),
+      error: errorMsg,
+    });
+    recordFailoverRecoveryFailure("health_record", {
+      operation: "recordNodeHealth",
+      nodeUrl: status.nodeUrl,
+      error: errorMsg,
     });
     return false;
   }
@@ -317,9 +323,15 @@ export async function recordNodeFailure(
 
     return mapHealthRow(write());
   } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error("Failed to record node failure", {
       nodeUrl,
-      error: err instanceof Error ? err.message : String(err),
+      error: errorMsg,
+    });
+    recordFailoverRecoveryFailure("node_failure", {
+      operation: "recordNodeFailure",
+      nodeUrl,
+      error: errorMsg,
     });
     return null;
   }
@@ -379,9 +391,15 @@ export async function recordNodeSuccess(
 
     return mapHealthRow(write());
   } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error("Failed to record node success", {
       nodeUrl,
-      error: err instanceof Error ? err.message : String(err),
+      error: errorMsg,
+    });
+    recordFailoverRecoveryFailure("health_record", {
+      operation: "recordNodeSuccess",
+      nodeUrl,
+      error: errorMsg,
     });
     return null;
   }
@@ -445,9 +463,15 @@ export async function failoverToNode(
       lastFailoverAt: row.last_failover_at,
     };
   } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error("Failed to fail over to node", {
       nodeUrl,
-      error: err instanceof Error ? err.message : String(err),
+      error: errorMsg,
+    });
+    recordFailoverRecoveryFailure("failover", {
+      operation: "failoverToNode",
+      nodeUrl,
+      error: errorMsg,
     });
     return null;
   }
@@ -492,6 +516,10 @@ export async function createFailoverServer<T>(
   const nodeUrl = selectHealthiestNode(nodeUrls);
   if (!nodeUrl) {
     logger.error("Cannot create failover server: no nodes configured");
+    recordFailoverRecoveryFailure("failover", {
+      operation: "createFailoverServer",
+      error: "Cannot create failover server: no nodes configured",
+    });
     return null;
   }
 
@@ -747,6 +775,7 @@ export function startFailoverRecovery(
     const report = assertFailoverRecoverySchemaValid(db);
     failoverRecoveryStarted = true;
     lastFailoverRecoverySchemaReport = report;
+    recordFailoverRecoverySuccess({ operation: "startFailoverRecovery" });
     logger.info("indexer_failover_recovery started", {
       started: true,
       valid: report.valid,
@@ -755,6 +784,10 @@ export function startFailoverRecovery(
   } catch (err) {
     failoverRecoveryStarted = false;
     lastFailoverRecoverySchemaReport = validateFailoverRecoverySchema(db);
+    recordFailoverRecoveryFailure("schema", {
+      operation: "startFailoverRecovery",
+      error: err instanceof Error ? err.message : String(err),
+    });
     throw err;
   }
 }
@@ -769,5 +802,274 @@ export function stopFailoverRecovery(): void {
 export function resetFailoverRecovery(): void {
   stopFailoverRecovery();
   clearFailoverRecoveryMigrationHooks();
+  resetFailoverRecoveryFailureMonitorState();
 }
+
+// ---------------------------------------------------------------------------
+// Consecutive failure and stall threshold alerting (#415)
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_FAILOVER_RECOVERY_FAILURE_THRESHOLD = 3;
+export const DEFAULT_FAILOVER_FAILURE_THRESHOLD = DEFAULT_FAILOVER_RECOVERY_FAILURE_THRESHOLD;
+
+export const DEFAULT_FAILOVER_RECOVERY_STALL_THRESHOLD_MS = 120_000;
+export const DEFAULT_FAILOVER_STALL_THRESHOLD_MS = DEFAULT_FAILOVER_RECOVERY_STALL_THRESHOLD_MS;
+
+export type FailoverRecoveryFailureType =
+  | "node_failure"
+  | "failover"
+  | "health_record"
+  | "schema"
+  | "retry"
+  | "stall"
+  | "operation"
+  | "query";
+
+export interface FailoverRecoveryFailureDetails {
+  error?: string;
+  operation?: string;
+  nodeUrl?: string;
+  elapsedMs?: number;
+  failureThreshold?: number;
+  [key: string]: unknown;
+}
+
+export interface FailoverRecoveryMonitorOptions {
+  name?: string;
+  failureThreshold?: number;
+  stallThresholdMs?: number;
+  repeatAlerts?: boolean;
+}
+
+export interface FailoverRecoveryAlertConfig {
+  failureThreshold: number;
+  stallThresholdMs: number;
+}
+
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) {
+    logger.warn("indexer_failover_recovery ignoring invalid threshold config", {
+      variable: name,
+      received: raw,
+      fallback,
+    });
+    return fallback;
+  }
+  return value;
+}
+
+export function getFailoverRecoveryAlertConfig(): FailoverRecoveryAlertConfig {
+  const failureThreshold =
+    process.env.FAILOVER_RECOVERY_FAILURE_THRESHOLD !== undefined
+      ? readPositiveIntEnv(
+          "FAILOVER_RECOVERY_FAILURE_THRESHOLD",
+          DEFAULT_FAILOVER_RECOVERY_FAILURE_THRESHOLD,
+        )
+      : process.env.INDEXER_FAILOVER_RECOVERY_FAILURE_THRESHOLD !== undefined
+        ? readPositiveIntEnv(
+            "INDEXER_FAILOVER_RECOVERY_FAILURE_THRESHOLD",
+            DEFAULT_FAILOVER_RECOVERY_FAILURE_THRESHOLD,
+          )
+        : readPositiveIntEnv(
+            "FAILOVER_FAILURE_THRESHOLD",
+            DEFAULT_FAILOVER_RECOVERY_FAILURE_THRESHOLD,
+          );
+
+  const stallThresholdMs =
+    process.env.FAILOVER_RECOVERY_STALL_THRESHOLD_MS !== undefined
+      ? readPositiveIntEnv(
+          "FAILOVER_RECOVERY_STALL_THRESHOLD_MS",
+          DEFAULT_FAILOVER_RECOVERY_STALL_THRESHOLD_MS,
+        )
+      : process.env.INDEXER_FAILOVER_RECOVERY_STALL_THRESHOLD_MS !== undefined
+        ? readPositiveIntEnv(
+            "INDEXER_FAILOVER_RECOVERY_STALL_THRESHOLD_MS",
+            DEFAULT_FAILOVER_RECOVERY_STALL_THRESHOLD_MS,
+          )
+        : readPositiveIntEnv(
+            "FAILOVER_STALL_THRESHOLD_MS",
+            DEFAULT_FAILOVER_RECOVERY_STALL_THRESHOLD_MS,
+          );
+
+  return { failureThreshold, stallThresholdMs };
+}
+
+export const getFailoverAlertConfig = getFailoverRecoveryAlertConfig;
+export const getIndexerFailoverRecoveryAlertConfig = getFailoverRecoveryAlertConfig;
+
+/**
+ * Tracks consecutive indexer_failover_recovery operation failures and stalls,
+ * raising warning alerts once configured thresholds are reached (#415).
+ */
+export class FailoverRecoveryFailureMonitor {
+  readonly component: string;
+  readonly failureThreshold: number;
+  readonly stallThresholdMs: number;
+  readonly repeatAlerts: boolean;
+
+  private consecutiveFailures = 0;
+  private lastSuccessfulAt: number | null = null;
+  private alertActive = false;
+  private stallAlerted = false;
+
+  constructor(options: FailoverRecoveryMonitorOptions = {}) {
+    const env = getFailoverRecoveryAlertConfig();
+    this.component = options.name ?? "indexer_failover_recovery";
+    this.failureThreshold = options.failureThreshold ?? env.failureThreshold;
+    this.stallThresholdMs = options.stallThresholdMs ?? env.stallThresholdMs;
+    this.repeatAlerts = options.repeatAlerts ?? false;
+  }
+
+  getConsecutiveFailures(): number {
+    return this.consecutiveFailures;
+  }
+
+  getLastSuccessfulAt(): number | null {
+    return this.lastSuccessfulAt;
+  }
+
+  isAlertActive(): boolean {
+    return this.alertActive;
+  }
+
+  getFailureThreshold(): number {
+    return this.failureThreshold;
+  }
+
+  getStallThresholdMs(): number {
+    return this.stallThresholdMs;
+  }
+
+  /**
+   * Record a failed indexer_failover_recovery operation.
+   * Logs an error every time and emits a warning alert when the
+   * consecutive-failure threshold is reached.
+   */
+  recordFailure(
+    failureType: FailoverRecoveryFailureType,
+    details: FailoverRecoveryFailureDetails = {},
+  ): number {
+    this.consecutiveFailures += 1;
+
+    const payload = {
+      component: this.component,
+      failureType,
+      operation: details.operation,
+      nodeUrl: details.nodeUrl,
+      consecutiveFailures: this.consecutiveFailures,
+      threshold: this.failureThreshold,
+      error: details.error,
+      elapsedMs: details.elapsedMs,
+    };
+
+    logger.error("indexer_failover_recovery operation failed", payload);
+
+    if (
+      this.consecutiveFailures === this.failureThreshold ||
+      (this.repeatAlerts && this.consecutiveFailures > this.failureThreshold)
+    ) {
+      this.alertActive = true;
+      logger.warn(
+        "indexer_failover_recovery alert: consecutive failure threshold reached",
+        {
+          ...payload,
+          action:
+            "Inspect RPC node health, failover state, and network connectivity; alerting clears automatically after the next successful operation.",
+        },
+      );
+    }
+
+    return this.consecutiveFailures;
+  }
+
+  /**
+   * Record a successful operation, clearing any active failure or stall alert.
+   */
+  recordSuccess(details?: { operation?: string; nodeUrl?: string }): void {
+    const hadFailures = this.consecutiveFailures > 0 || this.alertActive;
+    this.consecutiveFailures = 0;
+    this.lastSuccessfulAt = Date.now();
+    if (hadFailures) {
+      logger.info(
+        "indexer_failover_recovery recovered after consecutive failures",
+        {
+          component: this.component,
+          operation: details?.operation,
+          nodeUrl: details?.nodeUrl,
+        },
+      );
+    }
+    this.alertActive = false;
+    this.stallAlerted = false;
+  }
+
+  /**
+   * Warn when no successful operation has completed inside the stall window.
+   */
+  checkStall(): boolean {
+    if (this.lastSuccessfulAt === null) return false;
+    const elapsedMs = Date.now() - this.lastSuccessfulAt;
+    if (elapsedMs <= this.stallThresholdMs) return false;
+    if (this.stallAlerted) return true;
+
+    this.stallAlerted = true;
+    logger.warn("indexer_failover_recovery alert: stall threshold reached", {
+      component: this.component,
+      failureType: "stall" as const,
+      consecutiveFailures: this.consecutiveFailures,
+      threshold: this.failureThreshold,
+      stallThresholdMs: this.stallThresholdMs,
+      elapsedMs,
+      action:
+        "No successful indexer_failover_recovery operation within the stall window; inspect RPC nodes, network connectivity, and indexer health.",
+    });
+    return true;
+  }
+
+  reset(): void {
+    this.consecutiveFailures = 0;
+    this.lastSuccessfulAt = null;
+    this.alertActive = false;
+    this.stallAlerted = false;
+  }
+}
+
+export const IndexerFailoverRecoveryFailureMonitor = FailoverRecoveryFailureMonitor;
+
+let defaultFailoverRecoveryFailureMonitor = new FailoverRecoveryFailureMonitor();
+
+export function getFailoverRecoveryFailureMonitor(): FailoverRecoveryFailureMonitor {
+  return defaultFailoverRecoveryFailureMonitor;
+}
+
+export const getIndexerFailoverRecoveryFailureMonitor = getFailoverRecoveryFailureMonitor;
+
+export function resetFailoverRecoveryFailureMonitorState(): void {
+  defaultFailoverRecoveryFailureMonitor = new FailoverRecoveryFailureMonitor();
+}
+
+export const resetFailoverRecoveryAlertState = resetFailoverRecoveryFailureMonitorState;
+export const resetIndexerFailoverRecoveryFailureState = resetFailoverRecoveryFailureMonitorState;
+
+export function recordFailoverRecoveryFailure(
+  failureType: FailoverRecoveryFailureType,
+  details?: FailoverRecoveryFailureDetails,
+): number {
+  return defaultFailoverRecoveryFailureMonitor.recordFailure(failureType, details);
+}
+
+export function recordFailoverRecoverySuccess(details?: {
+  operation?: string;
+  nodeUrl?: string;
+}): void {
+  defaultFailoverRecoveryFailureMonitor.recordSuccess(details);
+}
+
+export function checkFailoverRecoveryStall(): boolean {
+  return defaultFailoverRecoveryFailureMonitor.checkStall();
+}
+
 
