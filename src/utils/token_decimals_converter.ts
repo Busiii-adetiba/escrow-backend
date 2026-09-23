@@ -23,12 +23,71 @@ export const ERROR_CODES = {
   INVALID_AMOUNT: "DECIMALS_INVALID_AMOUNT",
   INVALID_DECIMALS: "DECIMALS_INVALID_DECIMALS",
   CONVERSION_OVERFLOW: "DECIMALS_CONVERSION_OVERFLOW",
+  INVALID_SCHEMA: "DECIMALS_INVALID_SCHEMA",
 } as const;
 
 export type DecimalsErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
 
 export type ConversionResult =
   | { ok: true; value: bigint }
+  | { ok: false; error: string; code: DecimalsErrorCode };
+
+/**
+ * Configuration options for database precision schema and column mapping.
+ */
+export interface DbPrecisionSchema {
+  /** Column scale (decimal places). Defaults to token decimals if not specified. */
+  scale?: number;
+  /** Maximum safe precision (total digits). Defaults to MAX_SAFE_DIGITS (15). */
+  precision?: number;
+  /**
+   * Whether to format with fixed decimal scale by padding fractional digits
+   * with trailing zeroes to match the column scale (e.g. "1.5000000" for decimals=7).
+   * Defaults to true for database precision schemas.
+   */
+  fixedScale?: boolean;
+  /**
+   * Whether input is raw units, human units, or auto-detected.
+   * Defaults to "auto".
+   */
+  inputType?: "auto" | "raw" | "human";
+  /** Custom column names for database storage mapping. */
+  columns?: {
+    rawAmount?: string;
+    formattedAmount?: string;
+    decimals?: string;
+  };
+}
+
+/**
+ * Attributes for a database row storing a token amount with full precision.
+ */
+export interface DbStorageRow {
+  /** Raw on-chain integer amount string (exact integer, no precision loss). */
+  raw_amount: string;
+  /** Decimal amount string formatted to match database precision schema. */
+  formatted_amount: string;
+  /** Token decimals (scale). */
+  decimals: number;
+  /** Alias for raw_amount in camelCase. */
+  rawAmount: string;
+  /** Alias for formatted_amount in camelCase. */
+  formattedAmount: string;
+  /** Human-readable string with trimmed trailing zeroes. */
+  trimmed_amount: string;
+  /** Dynamic custom column mapping if custom column names were configured. */
+  [key: string]: string | number;
+}
+
+export type DbStorageColumns = DbStorageRow;
+
+export type DbFormatResult =
+  | {
+      ok: true;
+      value: DbStorageRow;
+      columns: DbStorageRow;
+      row: DbStorageRow;
+    }
   | { ok: false; error: string; code: DecimalsErrorCode };
 
 function digitCount(normalized: string): number {
@@ -207,14 +266,28 @@ export function toRawUnits(
   return { ok: true, value };
 }
 
+export interface ToHumanUnitsOptions {
+  /**
+   * When true, preserves fractional zeros up to `decimals` (fixed scale),
+   * matching database precision schemas (e.g. "1.5000000" for 7 decimals).
+   * Defaults to false (trimmed trailing zeros, e.g. "1.5").
+   */
+  fixedScale?: boolean;
+}
+
 /**
  * Convert a raw integer token amount back into a human-readable decimal
  * string by inserting the decimal point at the position given by decimals.
  * Rejects negative amounts as token amounts cannot be negative.
+ *
+ * @param rawAmount - The raw integer amount (bigint, number, or string)
+ * @param decimals - Token decimal places (0 to 18)
+ * @param options - Formatting options, e.g. fixedScale to preserve trailing zeroes
  */
 export function toHumanUnits(
   rawAmount: string | number | bigint,
-  decimals: number
+  decimals: number,
+  options?: ToHumanUnitsOptions
 ): { ok: true; value: string } | { ok: false; error: string; code: DecimalsErrorCode } {
   const decimalsCheck = validateDecimals(decimals);
   if (!decimalsCheck.ok) {
@@ -235,11 +308,296 @@ export function toHumanUnits(
   const padded = digits.padStart(decimals + 1, "0");
   const wholePart = padded.slice(0, padded.length - decimals);
   const fractionalPart = padded.slice(padded.length - decimals);
-  const trimmedFractional = fractionalPart.replace(/0+$/, "");
+  const trimmedFractional = options?.fixedScale
+    ? fractionalPart
+    : fractionalPart.replace(/0+$/, "");
 
   const value = trimmedFractional.length > 0
     ? `${wholePart}.${trimmedFractional}`
     : wholePart;
 
   return { ok: true, value };
+}
+
+/**
+ * Format a raw token amount to a decimal string matching a database precision schema's fixed scale.
+ */
+export function formatToDbPrecision(
+  rawAmount: string | number | bigint,
+  decimals: number,
+  options?: { fixedScale?: boolean; precision?: number }
+): { ok: true; value: string } | { ok: false; error: string; code: DecimalsErrorCode } {
+  return toHumanUnits(rawAmount, decimals, { fixedScale: options?.fixedScale ?? true });
+}
+
+/**
+ * Validate a database precision schema configuration.
+ */
+export function validateDbPrecisionSchema(
+  schema: DbPrecisionSchema
+): { ok: true } | { ok: false; error: string; code: DecimalsErrorCode } {
+  if (schema.scale !== undefined) {
+    const scaleCheck = validateDecimals(schema.scale);
+    if (!scaleCheck.ok) {
+      return scaleCheck;
+    }
+  }
+
+  if (schema.precision !== undefined) {
+    if (
+      typeof schema.precision !== "number" ||
+      !Number.isFinite(schema.precision) ||
+      !Number.isInteger(schema.precision) ||
+      schema.precision <= 0
+    ) {
+      return {
+        ok: false,
+        error: "schema precision must be a positive integer",
+        code: ERROR_CODES.INVALID_SCHEMA,
+      };
+    }
+    if (schema.precision > MAX_SAFE_DIGITS) {
+      return {
+        ok: false,
+        error: `schema precision cannot exceed ${MAX_SAFE_DIGITS} digits`,
+        code: ERROR_CODES.INVALID_SCHEMA,
+      };
+    }
+    if (schema.scale !== undefined && schema.scale > schema.precision) {
+      return {
+        ok: false,
+        error: "schema scale cannot exceed precision",
+        code: ERROR_CODES.INVALID_SCHEMA,
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Format values calculated by token_decimals_converter to match database
+ * precision schemas, producing row attributes that preserve full precision.
+ *
+ * @param amount - The raw integer amount (bigint, integer string/number) or human decimal amount (string/number with decimal point)
+ * @param decimals - The token decimals scale (0 to 18)
+ * @param schema - Optional database precision schema options (scale, precision, fixedScale, column mappings)
+ */
+export function formatForDbStorage(
+  amount: string | number | bigint | ConversionResult | { ok: true; value: string },
+  decimals: number,
+  schema?: DbPrecisionSchema
+): DbFormatResult {
+  const decimalsCheck = validateDecimals(decimals);
+  if (!decimalsCheck.ok) {
+    return decimalsCheck;
+  }
+
+  if (schema) {
+    const schemaCheck = validateDbPrecisionSchema(schema);
+    if (!schemaCheck.ok) {
+      return schemaCheck;
+    }
+  }
+
+  let unwrapped: string | number | bigint;
+  if (typeof amount === "object" && amount !== null && "ok" in amount) {
+    if (!amount.ok) {
+      return amount;
+    }
+    unwrapped = amount.value;
+  } else {
+    unwrapped = amount;
+  }
+
+  const effectiveScale = schema?.scale !== undefined ? schema.scale : decimals;
+  const isFixedScale = schema?.fixedScale ?? true;
+  const inputType = schema?.inputType ?? "auto";
+
+  let rawBigInt: bigint;
+  let rawStr: string;
+
+  if (typeof unwrapped === "bigint") {
+    if (inputType === "human") {
+      const rawResult = toRawUnits(unwrapped.toString(), effectiveScale);
+      if (!rawResult.ok) {
+        return rawResult;
+      }
+      rawBigInt = rawResult.value;
+      rawStr = rawBigInt.toString();
+    } else {
+      const rawCheck = validateRawAmount(unwrapped, "amount");
+      if (!rawCheck.ok) {
+        return rawCheck;
+      }
+      rawBigInt = rawCheck.value;
+      rawStr = rawBigInt.toString();
+    }
+  } else if (typeof unwrapped === "number") {
+    if (!Number.isFinite(unwrapped)) {
+      return {
+        ok: false,
+        error: "amount must be a finite number",
+        code: ERROR_CODES.INVALID_AMOUNT,
+      };
+    }
+    if (unwrapped < 0 || Object.is(unwrapped, -0)) {
+      return {
+        ok: false,
+        error: "amount cannot be negative",
+        code: ERROR_CODES.INVALID_AMOUNT,
+      };
+    }
+    if (inputType === "human" || !Number.isInteger(unwrapped)) {
+      const rawResult = toRawUnits(unwrapped, effectiveScale);
+      if (!rawResult.ok) {
+        return rawResult;
+      }
+      rawBigInt = rawResult.value;
+      rawStr = rawBigInt.toString();
+    } else {
+      const rawCheck = validateRawAmount(unwrapped, "amount");
+      if (!rawCheck.ok) {
+        return rawCheck;
+      }
+      rawBigInt = rawCheck.value;
+      rawStr = rawBigInt.toString();
+    }
+  } else {
+    const trimmed = unwrapped.trim();
+    if (trimmed.startsWith("-")) {
+      return {
+        ok: false,
+        error: "amount cannot be negative",
+        code: ERROR_CODES.INVALID_AMOUNT,
+      };
+    }
+    if (inputType === "human" || trimmed.includes(".")) {
+      const rawResult = toRawUnits(trimmed, effectiveScale);
+      if (!rawResult.ok) {
+        return rawResult;
+      }
+      rawBigInt = rawResult.value;
+      rawStr = rawBigInt.toString();
+    } else {
+      const rawCheck = validateRawAmount(trimmed, "amount");
+      if (!rawCheck.ok) {
+        return rawCheck;
+      }
+      rawBigInt = rawCheck.value;
+      rawStr = rawBigInt.toString();
+    }
+  }
+
+  const maxDigits = schema?.precision ?? MAX_SAFE_DIGITS;
+  if (digitCount(rawStr) > maxDigits) {
+    return {
+      ok: false,
+      error: `amount exceeds maximum allowed precision of ${maxDigits} digits`,
+      code: ERROR_CODES.EXCESSIVE_DIGITS,
+    };
+  }
+
+  const formattedResult = toHumanUnits(rawBigInt, effectiveScale, { fixedScale: isFixedScale });
+  if (!formattedResult.ok) {
+    return formattedResult;
+  }
+
+  const trimmedResult = toHumanUnits(rawBigInt, effectiveScale, { fixedScale: false });
+  const trimmedAmount = trimmedResult.ok ? trimmedResult.value : formattedResult.value;
+
+  const rawCol = schema?.columns?.rawAmount ?? "raw_amount";
+  const formattedCol = schema?.columns?.formattedAmount ?? "formatted_amount";
+  const decimalsCol = schema?.columns?.decimals ?? "decimals";
+
+  const row: DbStorageRow = {
+    raw_amount: rawStr,
+    formatted_amount: formattedResult.value,
+    decimals: effectiveScale,
+    rawAmount: rawStr,
+    formattedAmount: formattedResult.value,
+    trimmed_amount: trimmedAmount,
+    [rawCol]: rawStr,
+    [formattedCol]: formattedResult.value,
+    [decimalsCol]: effectiveScale,
+  };
+
+  return {
+    ok: true,
+    value: row,
+    columns: row,
+    row,
+  };
+}
+
+/**
+ * Format raw integer amount explicitly for database storage.
+ */
+export function formatRawForDbStorage(
+  rawAmount: string | number | bigint,
+  decimals: number,
+  schema?: DbPrecisionSchema
+): DbFormatResult {
+  return formatForDbStorage(rawAmount, decimals, { ...schema, inputType: "raw" });
+}
+
+/**
+ * Format human decimal amount explicitly for database storage.
+ */
+export function formatHumanForDbStorage(
+  humanAmount: string | number,
+  decimals: number,
+  schema?: DbPrecisionSchema
+): DbFormatResult {
+  return formatForDbStorage(humanAmount, decimals, { ...schema, inputType: "human" });
+}
+
+/**
+ * Alias for formatForDbStorage.
+ */
+export const formatDbColumns = formatForDbStorage;
+
+/**
+ * Alias for formatForDbStorage matching the exact issue name.
+ */
+export const formatColumnsForDbStorage = formatForDbStorage;
+
+/**
+ * Factory to configure format columns for database storage with default schema rules.
+ */
+export function configureFormatColumns(defaultSchema?: DbPrecisionSchema) {
+  return {
+    schema: defaultSchema,
+    format: (
+      amount: string | number | bigint | ConversionResult | { ok: true; value: string },
+      decimals?: number,
+      overrideSchema?: DbPrecisionSchema
+    ) =>
+      formatForDbStorage(
+        amount,
+        decimals ?? defaultSchema?.scale ?? 7,
+        { ...defaultSchema, ...overrideSchema }
+      ),
+    formatRaw: (
+      rawAmount: string | number | bigint,
+      decimals?: number,
+      overrideSchema?: DbPrecisionSchema
+    ) =>
+      formatRawForDbStorage(
+        rawAmount,
+        decimals ?? defaultSchema?.scale ?? 7,
+        { ...defaultSchema, ...overrideSchema }
+      ),
+    formatHuman: (
+      humanAmount: string | number,
+      decimals?: number,
+      overrideSchema?: DbPrecisionSchema
+    ) =>
+      formatHumanForDbStorage(
+        humanAmount,
+        decimals ?? defaultSchema?.scale ?? 7,
+        { ...defaultSchema, ...overrideSchema }
+      ),
+    validateSchema: (schema: DbPrecisionSchema) => validateDbPrecisionSchema(schema),
+  };
 }

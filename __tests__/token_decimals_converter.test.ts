@@ -1,3 +1,4 @@
+import Database from "better-sqlite3";
 import {
   MAX_SAFE_DIGITS,
   MAX_TOKEN_DECIMALS,
@@ -6,6 +7,15 @@ import {
   validateRawAmount,
   toRawUnits,
   toHumanUnits,
+  formatForDbStorage,
+  formatDbColumns,
+  formatColumnsForDbStorage,
+  formatToDbPrecision,
+  formatRawForDbStorage,
+  formatHumanForDbStorage,
+  configureFormatColumns,
+  validateDbPrecisionSchema,
+  DbPrecisionSchema,
 } from "../src/utils/token_decimals_converter.js";
 
 describe("token_decimals_converter overflow validation", () => {
@@ -776,4 +786,554 @@ describe("token_decimals_converter mathematical verification with detailed numer
     });
   });
 });
+
+describe("Configure format columns for DB storage in token_decimals_converter (#423)", () => {
+  describe("formatForDbStorage and formatDbColumns unit functionality", () => {
+    it("formats raw BigInt amount for 7 decimals (Stellar stroops) with full precision columns", () => {
+      const result = formatForDbStorage(15000000n, 7);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.raw_amount).toBe("15000000");
+        expect(result.value.formatted_amount).toBe("1.5000000");
+        expect(result.value.decimals).toBe(7);
+        expect(result.value.trimmed_amount).toBe("1.5");
+        // camelCase aliases
+        expect(result.value.rawAmount).toBe("15000000");
+        expect(result.value.formattedAmount).toBe("1.5000000");
+        // columns and row property aliases
+        expect(result.columns).toBe(result.value);
+        expect(result.row).toBe(result.value);
+      }
+    });
+
+    it("formats human decimal string amount for 7 decimals", () => {
+      const result = formatForDbStorage("1.5", 7);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.raw_amount).toBe("15000000");
+        expect(result.value.formatted_amount).toBe("1.5000000");
+        expect(result.value.decimals).toBe(7);
+        expect(result.value.trimmed_amount).toBe("1.5");
+      }
+    });
+
+    it("formats a sub-unit amount (1 stroop = 10^-7 XLM)", () => {
+      const result = formatForDbStorage(1n, 7);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.raw_amount).toBe("1");
+        expect(result.value.formatted_amount).toBe("0.0000001");
+        expect(result.value.decimals).toBe(7);
+        expect(result.value.trimmed_amount).toBe("0.0000001");
+      }
+    });
+
+    it("formats zero amount across decimal scales with exact scale padding", () => {
+      const res0 = formatForDbStorage(0n, 0);
+      expect(res0.ok).toBe(true);
+      if (res0.ok) {
+        expect(res0.value.raw_amount).toBe("0");
+        expect(res0.value.formatted_amount).toBe("0");
+        expect(res0.value.decimals).toBe(0);
+      }
+
+      const res2 = formatForDbStorage(0n, 2);
+      expect(res2.ok).toBe(true);
+      if (res2.ok) {
+        expect(res2.value.raw_amount).toBe("0");
+        expect(res2.value.formatted_amount).toBe("0.00");
+        expect(res2.value.decimals).toBe(2);
+      }
+
+      const res7 = formatForDbStorage("0", 7);
+      expect(res7.ok).toBe(true);
+      if (res7.ok) {
+        expect(res7.value.raw_amount).toBe("0");
+        expect(res7.value.formatted_amount).toBe("0.0000000");
+        expect(res7.value.decimals).toBe(7);
+      }
+    });
+
+    it("formats decimals=0 (indivisible tokens)", () => {
+      const result = formatForDbStorage(42n, 0);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.raw_amount).toBe("42");
+        expect(result.value.formatted_amount).toBe("42");
+        expect(result.value.decimals).toBe(0);
+        expect(result.value.trimmed_amount).toBe("42");
+      }
+    });
+
+    it("formats decimals=2 (fiat currency / cents)", () => {
+      const fromRaw = formatForDbStorage(10025n, 2);
+      expect(fromRaw.ok).toBe(true);
+      if (fromRaw.ok) {
+        expect(fromRaw.value.raw_amount).toBe("10025");
+        expect(fromRaw.value.formatted_amount).toBe("100.25");
+      }
+
+      const fromWhole = formatForDbStorage(10000n, 2);
+      expect(fromWhole.ok).toBe(true);
+      if (fromWhole.ok) {
+        expect(fromWhole.value.raw_amount).toBe("10000");
+        expect(fromWhole.value.formatted_amount).toBe("100.00");
+        expect(fromWhole.value.trimmed_amount).toBe("100");
+      }
+    });
+
+    it("formats decimals=6 (USDC micro-units)", () => {
+      const result = formatForDbStorage(1000000n, 6);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.raw_amount).toBe("1000000");
+        expect(result.value.formatted_amount).toBe("1.000000");
+        expect(result.value.trimmed_amount).toBe("1");
+      }
+    });
+
+    it("formats decimals=18 (EVM wei scale)", () => {
+      const result = formatForDbStorage(1n, 18);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.raw_amount).toBe("1");
+        expect(result.value.formatted_amount).toBe("0.000000000000000001");
+        expect(result.value.decimals).toBe(18);
+      }
+    });
+
+    it("unwraps ConversionResult passed from toRawUnits", () => {
+      const rawRes = toRawUnits("12.5", 7);
+      expect(rawRes.ok).toBe(true);
+      const dbRes = formatForDbStorage(rawRes, 7);
+      expect(dbRes.ok).toBe(true);
+      if (dbRes.ok) {
+        expect(dbRes.value.raw_amount).toBe("125000000");
+        expect(dbRes.value.formatted_amount).toBe("12.5000000");
+      }
+    });
+
+    it("formatDbColumns and formatColumnsForDbStorage act as direct aliases", () => {
+      const res1 = formatForDbStorage(15000000n, 7);
+      const res2 = formatDbColumns(15000000n, 7);
+      const res3 = formatColumnsForDbStorage(15000000n, 7);
+
+      expect(res1).toEqual(res2);
+      expect(res2).toEqual(res3);
+    });
+
+    it("supports formatRawForDbStorage and formatHumanForDbStorage explicitly", () => {
+      const rawRes = formatRawForDbStorage(100n, 2);
+      expect(rawRes.ok).toBe(true);
+      if (rawRes.ok) {
+        expect(rawRes.value.raw_amount).toBe("100");
+        expect(rawRes.value.formatted_amount).toBe("1.00");
+      }
+
+      const humanRes = formatHumanForDbStorage("100", 2);
+      expect(humanRes.ok).toBe(true);
+      if (humanRes.ok) {
+        expect(humanRes.value.raw_amount).toBe("10000");
+        expect(humanRes.value.formatted_amount).toBe("100.00");
+      }
+    });
+  });
+
+  describe("Custom database precision schema configuration", () => {
+    it("supports fixedScale: false for trimmed format", () => {
+      const result = formatForDbStorage(15000000n, 7, { fixedScale: false });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.formatted_amount).toBe("1.5");
+      }
+    });
+
+    it("maps custom column names to row attributes", () => {
+      const schema: DbPrecisionSchema = {
+        columns: {
+          rawAmount: "token_raw_amount",
+          formattedAmount: "token_display_amount",
+          decimals: "token_decimals_scale",
+        },
+      };
+
+      const result = formatForDbStorage(15000000n, 7, schema);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.token_raw_amount).toBe("15000000");
+        expect(result.value.token_display_amount).toBe("1.5000000");
+        expect(result.value.token_decimals_scale).toBe(7);
+        // Standard attributes also remain present
+        expect(result.value.raw_amount).toBe("15000000");
+        expect(result.value.formatted_amount).toBe("1.5000000");
+      }
+    });
+
+    it("enforces custom schema precision limit", () => {
+      const result = formatForDbStorage("123456789012", 2, { precision: 10 });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe(ERROR_CODES.EXCESSIVE_DIGITS);
+      }
+    });
+
+    it("accepts values within custom schema precision limit", () => {
+      const result = formatForDbStorage("12345678", 2, { precision: 10 });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.raw_amount).toBe("12345678");
+      }
+    });
+
+    it("validates database precision schema using validateDbPrecisionSchema", () => {
+      expect(validateDbPrecisionSchema({ scale: 7, precision: 15 }).ok).toBe(true);
+      expect(validateDbPrecisionSchema({ scale: -1 }).ok).toBe(false);
+      expect(validateDbPrecisionSchema({ scale: 20 }).ok).toBe(false);
+      expect(validateDbPrecisionSchema({ precision: -5 }).ok).toBe(false);
+      expect(validateDbPrecisionSchema({ precision: 20 }).ok).toBe(false);
+      expect(validateDbPrecisionSchema({ scale: 10, precision: 5 }).ok).toBe(false);
+    });
+
+    it("configureFormatColumns creates a pre-configured formatter factory", () => {
+      const formatter = configureFormatColumns({
+        scale: 7,
+        fixedScale: true,
+        columns: {
+          rawAmount: "on_chain_raw",
+          formattedAmount: "db_amount",
+          decimals: "asset_decimals",
+        },
+      });
+
+      const res = formatter.format(15000000n);
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect(res.value.on_chain_raw).toBe("15000000");
+        expect(res.value.db_amount).toBe("1.5000000");
+        expect(res.value.asset_decimals).toBe(7);
+      }
+    });
+  });
+
+  describe("formatToDbPrecision and toHumanUnits fixedScale option", () => {
+    it("formatToDbPrecision formats raw amounts to fixed scale string", () => {
+      const res = formatToDbPrecision(15000000n, 7);
+      expect(res).toEqual({ ok: true, value: "1.5000000" });
+
+      const resWhole = formatToDbPrecision(10000000n, 7);
+      expect(resWhole).toEqual({ ok: true, value: "1.0000000" });
+
+      const resCents = formatToDbPrecision(100n, 2);
+      expect(resCents).toEqual({ ok: true, value: "1.00" });
+    });
+
+    it("toHumanUnits preserves trailing zeroes when fixedScale: true is supplied", () => {
+      const trimmed = toHumanUnits(15000000n, 7);
+      expect(trimmed).toEqual({ ok: true, value: "1.5" });
+
+      const fixed = toHumanUnits(15000000n, 7, { fixedScale: true });
+      expect(fixed).toEqual({ ok: true, value: "1.5000000" });
+    });
+  });
+
+  describe("Negative parameter and overflow validation for DB storage", () => {
+    it("rejects negative raw amounts with INVALID_AMOUNT", () => {
+      const negBigInt = formatForDbStorage(-15000000n, 7);
+      expect(negBigInt.ok).toBe(false);
+      if (!negBigInt.ok) {
+        expect(negBigInt.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+      }
+
+      const negStr = formatForDbStorage("-100", 2);
+      expect(negStr.ok).toBe(false);
+      if (!negStr.ok) {
+        expect(negStr.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+      }
+
+      const negNum = formatForDbStorage(-42, 0);
+      expect(negNum.ok).toBe(false);
+      if (!negNum.ok) {
+        expect(negNum.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+      }
+    });
+
+    it("rejects negative human amounts with INVALID_AMOUNT", () => {
+      const negHuman = formatForDbStorage("-1.5", 7);
+      expect(negHuman.ok).toBe(false);
+      if (!negHuman.ok) {
+        expect(negHuman.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+      }
+    });
+
+    it("rejects negative decimals with INVALID_DECIMALS", () => {
+      const res = formatForDbStorage(15000000n, -1);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.code).toBe(ERROR_CODES.INVALID_DECIMALS);
+      }
+    });
+
+    it("rejects decimals exceeding MAX_TOKEN_DECIMALS", () => {
+      const res = formatForDbStorage(100n, MAX_TOKEN_DECIMALS + 1);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.code).toBe(ERROR_CODES.INVALID_DECIMALS);
+      }
+    });
+
+    it("rejects inputs exceeding MAX_SAFE_DIGITS (15) with EXCESSIVE_DIGITS", () => {
+      const tooBig = "1" + "0".repeat(MAX_SAFE_DIGITS);
+      const res = formatForDbStorage(tooBig, 7);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.code).toBe(ERROR_CODES.EXCESSIVE_DIGITS);
+      }
+    });
+  });
+
+  describe("Database row storage and precision preservation verification", () => {
+    let testDb: Database.Database;
+
+    beforeAll(() => {
+      testDb = new Database(":memory:");
+      testDb.exec(`
+        CREATE TABLE token_records (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          asset_code TEXT NOT NULL,
+          raw_amount TEXT NOT NULL,
+          formatted_amount TEXT NOT NULL,
+          decimals INTEGER NOT NULL,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+    });
+
+    afterAll(() => {
+      testDb.close();
+    });
+
+    interface TokenStorageCase {
+      assetCode: string;
+      raw: bigint;
+      decimals: number;
+      expectedFormatted: string;
+      expectedRaw: string;
+      description: string;
+    }
+
+    const storageCases: TokenStorageCase[] = [
+      {
+        assetCode: "XLM",
+        raw: 1n,
+        decimals: 7,
+        expectedFormatted: "0.0000001",
+        expectedRaw: "1",
+        description: "1 stroop minimum unit (10^-7)",
+      },
+      {
+        assetCode: "XLM",
+        raw: 15000000n,
+        decimals: 7,
+        expectedFormatted: "1.5000000",
+        expectedRaw: "15000000",
+        description: "1.5 XLM with 7 decimal fixed scale",
+      },
+      {
+        assetCode: "XLM",
+        raw: 100000000000000n,
+        decimals: 7,
+        expectedFormatted: "10000000.0000000",
+        expectedRaw: "100000000000000",
+        description: "10M XLM boundary (15 digits)",
+      },
+      {
+        assetCode: "XLM",
+        raw: 987654321098765n,
+        decimals: 7,
+        expectedFormatted: "98765432.1098765",
+        expectedRaw: "987654321098765",
+        description: "Max 15-digit safe value with full 7 fractional digits",
+      },
+      {
+        assetCode: "USDC",
+        raw: 1n,
+        decimals: 6,
+        expectedFormatted: "0.000001",
+        expectedRaw: "1",
+        description: "1 micro-unit USDC",
+      },
+      {
+        assetCode: "USDC",
+        raw: 1000000n,
+        decimals: 6,
+        expectedFormatted: "1.000000",
+        expectedRaw: "1000000",
+        description: "1 USDC whole unit",
+      },
+      {
+        assetCode: "USDC",
+        raw: 1250000n,
+        decimals: 6,
+        expectedFormatted: "1.250000",
+        expectedRaw: "1250000",
+        description: "1.25 USDC with trailing zeroes preserved",
+      },
+      {
+        assetCode: "BTC",
+        raw: 1n,
+        decimals: 8,
+        expectedFormatted: "0.00000001",
+        expectedRaw: "1",
+        description: "1 satoshi BTC",
+      },
+      {
+        assetCode: "BTC",
+        raw: 50000000n,
+        decimals: 8,
+        expectedFormatted: "0.50000000",
+        expectedRaw: "50000000",
+        description: "0.5 BTC (8 decimal fixed scale)",
+      },
+      {
+        assetCode: "USD",
+        raw: 1n,
+        decimals: 2,
+        expectedFormatted: "0.01",
+        expectedRaw: "1",
+        description: "1 cent",
+      },
+      {
+        assetCode: "USD",
+        raw: 10000n,
+        decimals: 2,
+        expectedFormatted: "100.00",
+        expectedRaw: "10000",
+        description: "100 dollars exact (2 decimal scale)",
+      },
+      {
+        assetCode: "USD",
+        raw: 999999999999999n,
+        decimals: 2,
+        expectedFormatted: "9999999999999.99",
+        expectedRaw: "999999999999999",
+        description: "15 digits cent amount",
+      },
+      {
+        assetCode: "NFT",
+        raw: 1n,
+        decimals: 0,
+        expectedFormatted: "1",
+        expectedRaw: "1",
+        description: "1 indivisible token unit",
+      },
+      {
+        assetCode: "NFT",
+        raw: 999999999999999n,
+        decimals: 0,
+        expectedFormatted: "999999999999999",
+        expectedRaw: "999999999999999",
+        description: "15 nines indivisible units",
+      },
+      {
+        assetCode: "ETH",
+        raw: 1n,
+        decimals: 18,
+        expectedFormatted: "0.000000000000000001",
+        expectedRaw: "1",
+        description: "1 wei minimum unit (18 decimals)",
+      },
+      {
+        assetCode: "ETH",
+        raw: 100000000000000n,
+        decimals: 18,
+        expectedFormatted: "0.000100000000000000",
+        expectedRaw: "100000000000000",
+        description: "15-digit EVM amount with 18 decimal fixed scale",
+      },
+    ];
+
+    it("Assert written row attributes preserve full precision", () => {
+      const insertStmt = testDb.prepare(`
+        INSERT INTO token_records (asset_code, raw_amount, formatted_amount, decimals)
+        VALUES (?, ?, ?, ?)
+      `);
+
+      const selectStmt = testDb.prepare(`
+        SELECT asset_code, raw_amount, formatted_amount, decimals
+        FROM token_records
+        WHERE id = ?
+      `);
+
+      storageCases.forEach(({ assetCode, raw, decimals, expectedFormatted, expectedRaw, description: _description }) => {
+        // Format columns using token_decimals_converter
+        const formatResult = formatForDbStorage(raw, decimals);
+        expect(formatResult.ok).toBe(true);
+        if (!formatResult.ok) return;
+
+        const { raw_amount, formatted_amount } = formatResult.value;
+
+        // Write row attributes to database table
+        const insertInfo = insertStmt.run(
+          assetCode,
+          raw_amount,
+          formatted_amount,
+          decimals
+        );
+        const rowId = insertInfo.lastInsertRowid;
+
+        // Query written row back from database
+        const writtenRow = selectStmt.get(rowId) as {
+          asset_code: string;
+          raw_amount: string;
+          formatted_amount: string;
+          decimals: number;
+        };
+
+        // Assert written row attributes preserve full precision
+        expect(writtenRow).toBeDefined();
+        expect(writtenRow.raw_amount).toBe(expectedRaw);
+        expect(writtenRow.formatted_amount).toBe(expectedFormatted);
+        expect(writtenRow.decimals).toBe(decimals);
+        expect(writtenRow.asset_code).toBe(assetCode);
+
+        // Assert exact string format has no scientific notation (no 'e' or 'E')
+        expect(writtenRow.raw_amount).not.toMatch(/[eE]/);
+        expect(writtenRow.formatted_amount).not.toMatch(/[eE]/);
+
+        // Assert round-trip back to BigInt preserves exact value
+        expect(BigInt(writtenRow.raw_amount)).toBe(raw);
+
+        // Assert round-trip back through toRawUnits preserves exact BigInt
+        const reConverted = toRawUnits(writtenRow.formatted_amount, writtenRow.decimals);
+        expect(reConverted.ok).toBe(true);
+        if (reConverted.ok) {
+          expect(reConverted.value).toBe(raw);
+        }
+      });
+    });
+
+    it("preserves full precision across multi-row database batch operations", () => {
+      const selectAll = testDb.prepare("SELECT raw_amount, formatted_amount, decimals FROM token_records");
+      const rows = selectAll.all() as { raw_amount: string; formatted_amount: string; decimals: number }[];
+
+      expect(rows.length).toBeGreaterThanOrEqual(storageCases.length);
+
+      // Verify every row in the database retains full string precision
+      rows.forEach((row) => {
+        expect(typeof row.raw_amount).toBe("string");
+        expect(typeof row.formatted_amount).toBe("string");
+        expect(row.raw_amount.length).toBeGreaterThan(0);
+        expect(row.formatted_amount.length).toBeGreaterThan(0);
+
+        // Re-conversion verification
+        const backToRaw = toRawUnits(row.formatted_amount, row.decimals);
+        expect(backToRaw.ok).toBe(true);
+        if (backToRaw.ok) {
+          expect(backToRaw.value.toString()).toBe(row.raw_amount);
+        }
+      });
+    });
+  });
+});
+
 
