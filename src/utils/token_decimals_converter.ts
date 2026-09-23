@@ -125,6 +125,13 @@ export function validateRawAmount(
     }
     raw = String(input);
   } else {
+    if (typeof input !== "string") {
+      return {
+        ok: false,
+        error: `${label} must be a string, number, or bigint`,
+        code: ERROR_CODES.INVALID_AMOUNT,
+      };
+    }
     raw = input.trim();
     if (!/^-?\d+$/.test(raw)) {
       return {
