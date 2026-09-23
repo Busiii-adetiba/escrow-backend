@@ -373,7 +373,16 @@ router.get(
   async (req: Request, res: Response) => {
     const address = req.params.address as string;
 
-    if (!ensureApiKey(req, res, "Unauthorized by-wallet request", { address })) return;
+    // Deliberately unauthenticated. Every field this returns (contract_id,
+    // role, milestone_count, latest_event_type, latest_ledger,
+    // latest_timestamp) is derived from Soroban contract events that the
+    // indexer reads from public RPC, so an API key here protected nothing
+    // that is not already on the ledger. It only stopped the browser, which
+    // cannot hold a secret, from reading its own job list.
+    //
+    // It is still a reverse index (address -> contracts) that the chain does
+    // not offer directly, so nginx rate limits this path separately. See
+    // escrow-frontend/nginx.conf, zone=api_public_read.
 
     try {
       const { page, limit } = (req as RequestWithValidatedQuery)
@@ -536,7 +545,10 @@ router.get(
 
     logger.info("Fetching job", { contractId });
 
-    if (!ensureApiKey(req, res, "Unauthorized request", { contractId })) return;
+    // Deliberately unauthenticated, for the same reason as
+    // GET /by-wallet/:address above: this reads contract state that anyone can
+    // simulate against the public RPC themselves. Rate limited at nginx via
+    // zone=api_public_read rather than by a key the browser would have to ship.
 
     try {
       const contract = new Contract(contractId);

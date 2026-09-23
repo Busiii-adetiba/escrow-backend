@@ -635,49 +635,63 @@ describe("GET /api/jobs/by-wallet/:address – status codes", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 401 – missing or wrong API key when API_KEY env var is set
+  // Deliberately unauthenticated.
+  //
+  // This endpoint returns only data the indexer read from public Soroban
+  // events, so it no longer requires x-api-key. These tests replace the
+  // previous 401 suite and exist to stop the gate being reintroduced by
+  // accident: the browser cannot hold a secret, so a key here only ever
+  // blocked the dashboard from reading its own job list.
   // -------------------------------------------------------------------------
 
-  it("returns 401 when API_KEY is set and no key is provided", async () => {
+  it("returns 200 without an API key even when API_KEY is set", async () => {
     process.env.API_KEY = "secret-test-key";
 
     const res = await request(app)
       .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
-      .expect(401);
-
-    expect(res.body).toEqual({ success: false, error: "Unauthorized" });
-  });
-
-  it("returns 401 when API_KEY is set and wrong key is provided", async () => {
-    process.env.API_KEY = "secret-test-key";
-
-    const res = await request(app)
-      .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
-      .set("x-api-key", "wrong-key")
-      .expect(401);
-
-    expect(res.body).toEqual({ success: false, error: "Unauthorized" });
-  });
-
-  it("returns 200 when API_KEY is set and correct key is provided", async () => {
-    process.env.API_KEY = "secret-test-key";
-
-    const res = await request(app)
-      .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
-      .set("x-api-key", "secret-test-key")
       .expect(200);
 
     expect(res.body.success).toBe(true);
   });
 
-  it("returns 401 (fails closed) when API_KEY env var is not set", async () => {
+  it("ignores a wrong API key rather than rejecting it", async () => {
+    process.env.API_KEY = "secret-test-key";
+
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
+      .set("x-api-key", "wrong-key")
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+  });
+
+  it("returns 200 when API_KEY is not configured at all", async () => {
     delete process.env.API_KEY;
 
     const res = await request(app)
       .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
-      .expect(401);
+      .expect(200);
 
-    expect(res.body).toEqual({ success: false, error: "Unauthorized" });
+    expect(res.body.success).toBe(true);
+  });
+
+  it("never returns fields beyond the public event summary", async () => {
+    delete process.env.API_KEY;
+
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
+      .expect(200);
+
+    for (const job of res.body.data.jobs) {
+      expect(Object.keys(job).sort()).toEqual([
+        "contract_id",
+        "latest_event_type",
+        "latest_ledger",
+        "latest_timestamp",
+        "milestone_count",
+        "role",
+      ]);
+    }
   });
 
   // -------------------------------------------------------------------------
