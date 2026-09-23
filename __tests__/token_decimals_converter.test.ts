@@ -87,6 +87,32 @@ describe("token_decimals_converter overflow validation", () => {
         expect(result.code).toBe(ERROR_CODES.INVALID_AMOUNT);
       }
     });
+
+    it("rejects negative amounts with DECIMALS_INVALID_AMOUNT", () => {
+      const negBigInt = validateRawAmount(-1n);
+      expect(negBigInt.ok).toBe(false);
+      if (!negBigInt.ok) {
+        expect(negBigInt.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+      }
+
+      const negNum = validateRawAmount(-42);
+      expect(negNum.ok).toBe(false);
+      if (!negNum.ok) {
+        expect(negNum.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+      }
+
+      const negStr = validateRawAmount("-10");
+      expect(negStr.ok).toBe(false);
+      if (!negStr.ok) {
+        expect(negStr.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+      }
+
+      const negZero = validateRawAmount("-0");
+      expect(negZero.ok).toBe(false);
+      if (!negZero.ok) {
+        expect(negZero.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+      }
+    });
   });
 
   describe("toRawUnits", () => {
@@ -136,6 +162,34 @@ describe("token_decimals_converter overflow validation", () => {
       expect(result.ok).toBe(false);
       if (!result.ok) {
         expect(result.code).toBe(ERROR_CODES.CONVERSION_OVERFLOW);
+      }
+    });
+
+    it("rejects negative human amounts with DECIMALS_INVALID_AMOUNT", () => {
+      const negNum = toRawUnits(-1.5, 7);
+      expect(negNum.ok).toBe(false);
+      if (!negNum.ok) {
+        expect(negNum.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+      }
+
+      const negStr = toRawUnits("-1.5", 7);
+      expect(negStr.ok).toBe(false);
+      if (!negStr.ok) {
+        expect(negStr.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+      }
+
+      const negZero = toRawUnits("-0", 2);
+      expect(negZero.ok).toBe(false);
+      if (!negZero.ok) {
+        expect(negZero.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+      }
+    });
+
+    it("rejects negative decimals with DECIMALS_INVALID_DECIMALS", () => {
+      const result = toRawUnits("1.5", -1);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe(ERROR_CODES.INVALID_DECIMALS);
       }
     });
   });
@@ -191,6 +245,34 @@ describe("token_decimals_converter overflow validation", () => {
       expect(result.ok).toBe(false);
       if (!result.ok) {
         expect(result.code).toBe(ERROR_CODES.EXCESSIVE_DIGITS);
+      }
+    });
+
+    it("rejects negative raw amounts with DECIMALS_INVALID_AMOUNT", () => {
+      const negBigInt = toHumanUnits(-15000000n, 7);
+      expect(negBigInt.ok).toBe(false);
+      if (!negBigInt.ok) {
+        expect(negBigInt.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+      }
+
+      const negNum = toHumanUnits(-42, 0);
+      expect(negNum.ok).toBe(false);
+      if (!negNum.ok) {
+        expect(negNum.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+      }
+
+      const negStr = toHumanUnits("-100", 2);
+      expect(negStr.ok).toBe(false);
+      if (!negStr.ok) {
+        expect(negStr.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+      }
+    });
+
+    it("rejects negative decimals with DECIMALS_INVALID_DECIMALS", () => {
+      const result = toHumanUnits(100n, -1);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe(ERROR_CODES.INVALID_DECIMALS);
       }
     });
   });
@@ -467,8 +549,8 @@ describe("token_decimals_converter mathematical verification with detailed numer
     });
   });
 
-  // Zero and signed values arithmetic verification
-  describe("Zero and signed value numeric calculations", () => {
+  // Zero and negative value rejection calculations
+  describe("Zero value and negative parameter rejection numeric calculations", () => {
     const decimalScales = [0, 1, 2, 6, 7, 8, 9, 12, 18];
 
     describe("zero value conversions across all decimal scales", () => {
@@ -477,14 +559,11 @@ describe("token_decimals_converter mathematical verification with detailed numer
           expect(toHumanUnits(0n, dec)).toEqual({ ok: true, value: "0" });
           expect(toHumanUnits(0, dec)).toEqual({ ok: true, value: "0" });
           expect(toHumanUnits("0", dec)).toEqual({ ok: true, value: "0" });
-          expect(toHumanUnits("-0", dec)).toEqual({ ok: true, value: "0" });
 
           expect(toRawUnits("0", dec)).toEqual({ ok: true, value: 0n });
-          expect(toRawUnits("-0", dec)).toEqual({ ok: true, value: 0n });
 
           if (dec > 0) {
             expect(toRawUnits("0.0", dec)).toEqual({ ok: true, value: 0n });
-            expect(toRawUnits("-0.0", dec)).toEqual({ ok: true, value: 0n });
           } else {
             // For decimals=0, any fractional point constitutes invalid fractional precision
             const result = toRawUnits("0.0", 0);
@@ -493,32 +572,86 @@ describe("token_decimals_converter mathematical verification with detailed numer
               expect(result.code).toBe(ERROR_CODES.INVALID_AMOUNT);
             }
           }
+
+          // Negative zero representations are rejected as negative parameters
+          expect(toHumanUnits("-0", dec).ok).toBe(false);
+          expect(toRawUnits("-0", dec).ok).toBe(false);
+          expect(toRawUnits("-0.0", dec).ok).toBe(false);
         });
       });
     });
 
-    describe("negative amount numeric calculations", () => {
-      const negativeCases: NumericTestCase[] = [
-        { raw: -1n, decimals: 7, expectedHuman: "-0.0000001", description: "-1 stroop" },
-        { raw: -10000000n, decimals: 7, expectedHuman: "-1", description: "-1 XLM" },
-        { raw: -15000000n, decimals: 7, expectedHuman: "-1.5", description: "-1.5 XLM" },
-        { raw: -105n, decimals: 2, expectedHuman: "-1.05", description: "-1.05 fiat" },
-        { raw: -42n, decimals: 0, expectedHuman: "-42", description: "-42 integer" },
-        { raw: -999999999999999n, decimals: 7, expectedHuman: "-99999999.9999999", description: "negative 15-digit boundary" },
+    describe("negative parameter rejection across diverse amounts and decimal scales", () => {
+      const negativeAmounts = [
+        -1n,
+        -10000000n,
+        -15000000n,
+        -105n,
+        -42n,
+        -999999999999999n,
       ];
+      const negativeHumanAmounts = [
+        "-0.0000001",
+        "-1",
+        "-1.5",
+        "-105.50",
+        "-42",
+        "-99999999.9999999",
+        -1.5,
+        -42,
+      ];
+      const negativeDecimals = [-1, -5, -18];
 
-      negativeCases.forEach(({ raw, decimals, expectedHuman, description }) => {
-        it(`correctly converts negative amount for ${description}: ${raw} <-> "${expectedHuman}"`, () => {
-          const human = toHumanUnits(raw, decimals);
-          expect(human.ok).toBe(true);
-          if (human.ok) {
-            expect(human.value).toBe(expectedHuman);
+      negativeAmounts.forEach((raw) => {
+        it(`rejects negative raw amount ${raw} in validateRawAmount`, () => {
+          const res = validateRawAmount(raw);
+          expect(res.ok).toBe(false);
+          if (!res.ok) {
+            expect(res.code).toBe(ERROR_CODES.INVALID_AMOUNT);
           }
+        });
 
-          const rawResult = toRawUnits(expectedHuman, decimals);
-          expect(rawResult.ok).toBe(true);
-          if (rawResult.ok) {
-            expect(rawResult.value).toBe(raw);
+        it(`rejects negative raw amount ${raw} in toHumanUnits`, () => {
+          const res = toHumanUnits(raw, 7);
+          expect(res.ok).toBe(false);
+          if (!res.ok) {
+            expect(res.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+          }
+        });
+      });
+
+      negativeHumanAmounts.forEach((human) => {
+        it(`rejects negative human amount ${human} in toRawUnits`, () => {
+          const res = toRawUnits(human, 7);
+          expect(res.ok).toBe(false);
+          if (!res.ok) {
+            expect(res.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+          }
+        });
+      });
+
+      negativeDecimals.forEach((dec) => {
+        it(`rejects negative decimals ${dec} in validateDecimals`, () => {
+          const res = validateDecimals(dec);
+          expect(res.ok).toBe(false);
+          if (!res.ok) {
+            expect(res.code).toBe(ERROR_CODES.INVALID_DECIMALS);
+          }
+        });
+
+        it(`rejects negative decimals ${dec} in toRawUnits`, () => {
+          const res = toRawUnits("100", dec);
+          expect(res.ok).toBe(false);
+          if (!res.ok) {
+            expect(res.code).toBe(ERROR_CODES.INVALID_DECIMALS);
+          }
+        });
+
+        it(`rejects negative decimals ${dec} in toHumanUnits`, () => {
+          const res = toHumanUnits(100n, dec);
+          expect(res.ok).toBe(false);
+          if (!res.ok) {
+            expect(res.code).toBe(ERROR_CODES.INVALID_DECIMALS);
           }
         });
       });
@@ -617,9 +750,12 @@ describe("token_decimals_converter mathematical verification with detailed numer
       expect(fromLeadingZeros).toEqual({ ok: true, value: "1.5" });
     });
 
-    it("handles negative strings with leading zeros in toHumanUnits", () => {
+    it("rejects negative strings with leading zeros in toHumanUnits", () => {
       const result = toHumanUnits("-00015000000", 7);
-      expect(result).toEqual({ ok: true, value: "-1.5" });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe(ERROR_CODES.INVALID_AMOUNT);
+      }
     });
 
     it("produces identical raw units for number, string, and strings with trailing zeros in toRawUnits", () => {

@@ -67,6 +67,7 @@ export function validateDecimals(
 
 /**
  * Parse and validate a raw (integer, on-chain) token amount against digit limits.
+ * Rejects negative amounts as token balances/transfers cannot be negative.
  */
 export function validateRawAmount(
   input: string | number | bigint,
@@ -75,6 +76,13 @@ export function validateRawAmount(
   let raw: string;
 
   if (typeof input === "bigint") {
+    if (input < 0n) {
+      return {
+        ok: false,
+        error: `${label} cannot be negative`,
+        code: ERROR_CODES.INVALID_AMOUNT,
+      };
+    }
     raw = input.toString();
   } else if (typeof input === "number") {
     if (!Number.isFinite(input) || !Number.isInteger(input)) {
@@ -84,10 +92,24 @@ export function validateRawAmount(
         code: ERROR_CODES.INVALID_AMOUNT,
       };
     }
+    if (input < 0 || Object.is(input, -0)) {
+      return {
+        ok: false,
+        error: `${label} cannot be negative`,
+        code: ERROR_CODES.INVALID_AMOUNT,
+      };
+    }
     raw = String(input);
   } else {
     raw = input.trim();
-    if (!/^-?\d+$/.test(raw)) {
+    if (raw.startsWith("-")) {
+      return {
+        ok: false,
+        error: `${label} cannot be negative`,
+        code: ERROR_CODES.INVALID_AMOUNT,
+      };
+    }
+    if (!/^\d+$/.test(raw)) {
       return {
         ok: false,
         error: `${label} must be an integer numeric value`,
@@ -110,6 +132,7 @@ export function validateRawAmount(
 /**
  * Convert a human-readable decimal amount (e.g. "12.5") into raw integer
  * units by scaling with the token's decimals value (raw = human * 10^decimals).
+ * Rejects negative amounts as token amounts cannot be negative.
  */
 export function toRawUnits(
   humanAmount: string | number,
@@ -131,8 +154,27 @@ export function toRawUnits(
     };
   }
 
+  if (
+    typeof humanAmount === "number" &&
+    (humanAmount < 0 || Object.is(humanAmount, -0))
+  ) {
+    return {
+      ok: false,
+      error: "amount cannot be negative",
+      code: ERROR_CODES.INVALID_AMOUNT,
+    };
+  }
+
   const raw = String(humanAmount).trim();
-  if (!/^-?\d+(\.\d+)?$/.test(raw)) {
+  if (raw.startsWith("-")) {
+    return {
+      ok: false,
+      error: "amount cannot be negative",
+      code: ERROR_CODES.INVALID_AMOUNT,
+    };
+  }
+
+  if (!/^\d+(\.\d+)?$/.test(raw)) {
     return {
       ok: false,
       error: "amount must be a numeric decimal value",
@@ -140,9 +182,7 @@ export function toRawUnits(
     };
   }
 
-  const negative = raw.startsWith("-");
-  const unsigned = negative ? raw.slice(1) : raw;
-  const [wholePart, fractionalPart = ""] = unsigned.split(".");
+  const [wholePart, fractionalPart = ""] = raw.split(".");
 
   if (fractionalPart.length > decimals) {
     return {
@@ -163,13 +203,14 @@ export function toRawUnits(
     };
   }
 
-  const value = BigInt(combined) * (negative ? -1n : 1n);
+  const value = BigInt(combined);
   return { ok: true, value };
 }
 
 /**
  * Convert a raw integer token amount back into a human-readable decimal
  * string by inserting the decimal point at the position given by decimals.
+ * Rejects negative amounts as token amounts cannot be negative.
  */
 export function toHumanUnits(
   rawAmount: string | number | bigint,
@@ -185,11 +226,10 @@ export function toHumanUnits(
     return rawCheck;
   }
 
-  const negative = rawCheck.value < 0n;
-  const digits = (negative ? -rawCheck.value : rawCheck.value).toString();
+  const digits = rawCheck.value.toString();
 
   if (decimals === 0) {
-    return { ok: true, value: `${negative ? "-" : ""}${digits}` };
+    return { ok: true, value: digits };
   }
 
   const padded = digits.padStart(decimals + 1, "0");
@@ -201,5 +241,5 @@ export function toHumanUnits(
     ? `${wholePart}.${trimmedFractional}`
     : wholePart;
 
-  return { ok: true, value: `${negative ? "-" : ""}${value}` };
+  return { ok: true, value };
 }
