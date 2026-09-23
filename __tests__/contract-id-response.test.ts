@@ -64,37 +64,36 @@ describe("GET /api/jobs/:contractId – response format and status codes", () =>
     ]);
   });
 
-  it("returns 401 when API_KEY is configured and the header is missing", async () => {
+  // Deliberately unauthenticated. This route reads contract state that anyone
+  // can simulate against public RPC, so it no longer requires x-api-key. These
+  // three replace the previous 401 suite and exist to stop the gate being
+  // reintroduced: a browser cannot hold a secret, so the key only ever blocked
+  // the dashboard from reading public data.
+
+  it("reaches the contract when API_KEY is configured and the header is missing", async () => {
+    process.env.API_KEY = "secret-key";
+
+    await request(buildApp()).get(`/api/jobs/${VALID_CONTRACT}`);
+
+    expect(mockGetAccount).toHaveBeenCalled();
+  });
+
+  it("ignores a wrong API key rather than rejecting it", async () => {
     process.env.API_KEY = "secret-key";
 
     const res = await request(buildApp())
       .get(`/api/jobs/${VALID_CONTRACT}`)
-      .expect(401);
+      .set("x-api-key", "wrong-key");
 
-    expect(res.body).toEqual({ success: false, error: "Unauthorized" });
-    expect(mockGetAccount).not.toHaveBeenCalled();
+    expect(res.status).not.toBe(401);
   });
 
-  it("returns 401 when API_KEY is configured and the header is wrong", async () => {
-    process.env.API_KEY = "secret-key";
-
-    const res = await request(buildApp())
-      .get(`/api/jobs/${VALID_CONTRACT}`)
-      .set("x-api-key", "wrong-key")
-      .expect(401);
-
-    expect(res.body).toEqual({ success: false, error: "Unauthorized" });
-  });
-
-  it("returns 401 (fails closed) when API_KEY is not set", async () => {
+  it("does not fail closed when API_KEY is not set", async () => {
     delete process.env.API_KEY;
 
-    const res = await request(buildApp())
-      .get(`/api/jobs/${VALID_CONTRACT}`)
-      .expect(401);
+    await request(buildApp()).get(`/api/jobs/${VALID_CONTRACT}`);
 
-    expect(res.body).toEqual({ success: false, error: "Unauthorized" });
-    expect(mockGetAccount).not.toHaveBeenCalled();
+    expect(mockGetAccount).toHaveBeenCalled();
   });
 
   it("returns 404 when simulation reports the job was not found", async () => {
@@ -222,10 +221,15 @@ describe("GET /api/jobs/:contractId – logging traces", () => {
     expect(warnSpy).toHaveBeenCalledWith("Invalid contractId provided", { contractId: "not-a-contract" });
   });
 
-  it("logs 'Unauthorized request' when API_KEY is required but missing", async () => {
+  it("does not reject the request when API_KEY is set but not supplied", async () => {
+    // This route is deliberately unauthenticated: it reads contract state
+    // anyone can simulate against public RPC. The gate used to log
+    // "Unauthorized request" here and return 401.
     process.env.API_KEY = "secret-key";
     await request(buildApp()).get(`/api/jobs/${VALID_CONTRACT}`);
-    expect(warnSpy).toHaveBeenCalledWith("Unauthorized request", { contractId: VALID_CONTRACT });
+    expect(warnSpy).not.toHaveBeenCalledWith("Unauthorized request", {
+      contractId: VALID_CONTRACT,
+    });
   });
 
   it("logs 'Job not found' when simulation reports not found", async () => {
