@@ -23,6 +23,7 @@ export const ERROR_CODES = {
   INVALID_AMOUNT: "DECIMALS_INVALID_AMOUNT",
   INVALID_DECIMALS: "DECIMALS_INVALID_DECIMALS",
   CONVERSION_OVERFLOW: "DECIMALS_CONVERSION_OVERFLOW",
+  RATE_LIMITED: "DECIMALS_RATE_LIMITED",
 } as const;
 
 export type DecimalsErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
@@ -30,6 +31,43 @@ export type DecimalsErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
 export type ConversionResult =
   | { ok: true; value: bigint }
   | { ok: false; error: string; code: DecimalsErrorCode };
+
+/** Max conversion calls allowed per rate-limit window before calls are rejected. */
+export const RATE_LIMIT_MAX_CALLS = 1000;
+
+/** Rate-limit window size, in milliseconds. */
+export const RATE_LIMIT_WINDOW_MS = 60_000;
+
+let rateLimitWindowStart = Date.now();
+let rateLimitCallCount = 0;
+
+/**
+ * Guard against excessive conversion call volume within a rolling window.
+ * This module has no HTTP route of its own, so callers get the same 429-style
+ * rejection semantics used by the app's request-level rate limiters, scoped
+ * to this module's own call volume instead of a client IP.
+ */
+function checkConversionRateLimit():
+  | { ok: true }
+  | { ok: false; error: string; code: DecimalsErrorCode } {
+  const now = Date.now();
+  if (now - rateLimitWindowStart >= RATE_LIMIT_WINDOW_MS) {
+    rateLimitWindowStart = now;
+    rateLimitCallCount = 0;
+  }
+
+  rateLimitCallCount += 1;
+
+  if (rateLimitCallCount > RATE_LIMIT_MAX_CALLS) {
+    return {
+      ok: false,
+      error: `conversion rate limit exceeded: max ${RATE_LIMIT_MAX_CALLS} calls per ${RATE_LIMIT_WINDOW_MS}ms`,
+      code: ERROR_CODES.RATE_LIMITED,
+    };
+  }
+
+  return { ok: true };
+}
 
 function digitCount(normalized: string): number {
   const digits = normalized.replace(/^-/, "").replace(/^0+(?=\d)/, "");
@@ -115,6 +153,11 @@ export function toRawUnits(
   humanAmount: string | number,
   decimals: number
 ): ConversionResult {
+  const rateCheck = checkConversionRateLimit();
+  if (!rateCheck.ok) {
+    return rateCheck;
+  }
+
   const decimalsCheck = validateDecimals(decimals);
   if (!decimalsCheck.ok) {
     return decimalsCheck;
@@ -175,6 +218,11 @@ export function toHumanUnits(
   rawAmount: string | number | bigint,
   decimals: number
 ): { ok: true; value: string } | { ok: false; error: string; code: DecimalsErrorCode } {
+  const rateCheck = checkConversionRateLimit();
+  if (!rateCheck.ok) {
+    return rateCheck;
+  }
+
   const decimalsCheck = validateDecimals(decimals);
   if (!decimalsCheck.ok) {
     return decimalsCheck;
