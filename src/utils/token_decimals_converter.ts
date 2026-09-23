@@ -24,6 +24,7 @@ export const ERROR_CODES = {
   INVALID_DECIMALS: "DECIMALS_INVALID_DECIMALS",
   CONVERSION_OVERFLOW: "DECIMALS_CONVERSION_OVERFLOW",
   RATE_LIMITED: "DECIMALS_RATE_LIMITED",
+  SUM_MISMATCH: "DECIMALS_SUM_MISMATCH",
 } as const;
 
 export type DecimalsErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
@@ -143,6 +144,40 @@ export function validateRawAmount(
   }
 
   return { ok: true, value: BigInt(raw) };
+}
+
+/**
+ * Confirm that a set of split raw amounts sums exactly to the given base
+ * raw amount, rejecting allocations that over- or under-allocate the total.
+ */
+export function validateSplitSum(
+  parts: Array<string | number | bigint>,
+  baseAmount: string | number | bigint
+): ConversionResult {
+  let total = 0n;
+
+  for (let i = 0; i < parts.length; i++) {
+    const checked = validateRawAmount(parts[i], `parts[${i}]`);
+    if (!checked.ok) {
+      return checked;
+    }
+    total += checked.value;
+  }
+
+  const baseCheck = validateRawAmount(baseAmount, "baseAmount");
+  if (!baseCheck.ok) {
+    return baseCheck;
+  }
+
+  if (total !== baseCheck.value) {
+    return {
+      ok: false,
+      error: `split total (${total}) does not match base amount (${baseCheck.value})`,
+      code: ERROR_CODES.SUM_MISMATCH,
+    };
+  }
+
+  return { ok: true, value: total };
 }
 
 /**
