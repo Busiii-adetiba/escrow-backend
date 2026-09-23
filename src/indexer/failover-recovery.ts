@@ -1,4 +1,5 @@
-import { getDb } from "./db.js";
+import Database from "better-sqlite3";
+import { getDb, getShippedMigrationVersions } from "./db.js";
 import logger from "../utils/logger.js";
 
 /**
@@ -500,3 +501,273 @@ export async function createFailoverServer<T>(
 
   return { server: createServer(nodeUrl), nodeUrl };
 }
+
+// ---------------------------------------------------------------------------
+// Migration verification hooks (#417)
+// ---------------------------------------------------------------------------
+
+/**
+ * Tables and columns required by indexer_failover_recovery to operate safely.
+ */
+export const FAILOVER_RECOVERY_REQUIRED_SCHEMA: Record<string, string[]> = {
+  rpc_node_health: [
+    "node_url",
+    "is_healthy",
+    "failure_count",
+    "last_failure_at",
+    "last_success_at",
+    "next_retry_at",
+    "backoff_duration_ms",
+    "consecutive_successes",
+  ],
+  failover_state: [
+    "id",
+    "active_node_url",
+    "total_failovers",
+    "last_failover_at",
+  ],
+  node_failure_events: [
+    "id",
+    "node_url",
+    "error_message",
+    "retry_count",
+    "recovery_attempt_at",
+  ],
+  schema_migrations: ["version"],
+};
+
+export interface FailoverRecoverySchemaReport {
+  valid: boolean;
+  missingTables: string[];
+  missingColumns: Record<string, string[]>;
+  missingMigrations: number[];
+  errors: string[];
+  issues: string[];
+}
+
+export class FailoverRecoverySchemaError extends Error {
+  readonly issues: string[];
+
+  constructor(message: string, issues: string[] = []) {
+    super(message);
+    this.name = "FailoverRecoverySchemaError";
+    this.issues = issues;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export type FailoverRecoveryMigrationHook = (
+  db: Database.Database,
+) => string[] | string | void;
+
+const failoverRecoveryMigrationHooks = new Map<string, FailoverRecoveryMigrationHook>();
+
+export function registerFailoverRecoveryMigrationHook(
+  name: string,
+  hook: FailoverRecoveryMigrationHook,
+): void {
+  failoverRecoveryMigrationHooks.set(name, hook);
+}
+
+export function unregisterFailoverRecoveryMigrationHook(name: string): boolean {
+  return failoverRecoveryMigrationHooks.delete(name);
+}
+
+export function clearFailoverRecoveryMigrationHooks(): void {
+  failoverRecoveryMigrationHooks.clear();
+}
+
+export function getFailoverRecoveryMigrationHookNames(): string[] {
+  return [...failoverRecoveryMigrationHooks.keys()];
+}
+
+// Aliases for generic migration hook registration
+export const registerMigrationVerificationHook = registerFailoverRecoveryMigrationHook;
+export const registerMigrationHook = registerFailoverRecoveryMigrationHook;
+export const unregisterMigrationVerificationHook = unregisterFailoverRecoveryMigrationHook;
+export const clearMigrationVerificationHooks = clearFailoverRecoveryMigrationHooks;
+export const getMigrationVerificationHookNames = getFailoverRecoveryMigrationHookNames;
+
+/**
+ * Validate that every table, column, and migration required by indexer_failover_recovery
+ * is present and healthy. Reports all issues at once rather than failing on the first.
+ */
+export function validateFailoverRecoverySchema(
+  targetDb?: Database.Database,
+): FailoverRecoverySchemaReport {
+  const database = targetDb || getDb();
+  const missingTables: string[] = [];
+  const missingColumns: Record<string, string[]> = {};
+  const missingMigrations: number[] = [];
+  const errors: string[] = [];
+
+  for (const [table, requiredColumns] of Object.entries(
+    FAILOVER_RECOVERY_REQUIRED_SCHEMA,
+  )) {
+    const exists = database
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?")
+      .get(table);
+
+    if (!exists) {
+      missingTables.push(table);
+      errors.push(`Missing table: ${table}`);
+      continue;
+    }
+
+    const columns = (
+      database.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+        name: string;
+      }>
+    ).map((c) => c.name);
+
+    const absent = requiredColumns.filter((c) => !columns.includes(c));
+    if (absent.length > 0) {
+      missingColumns[table] = absent;
+      errors.push(`Missing columns in ${table}: ${absent.join(", ")}`);
+    }
+  }
+
+  // Verify migrations completeness and continuity when schema_migrations exists
+  if (!missingTables.includes("schema_migrations")) {
+    try {
+      const appliedRows = database
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .all() as Array<{ version: number }>;
+      const applied = new Set(appliedRows.map((r) => r.version));
+
+      for (const version of getShippedMigrationVersions()) {
+        if (!applied.has(version)) {
+          missingMigrations.push(version);
+        }
+      }
+
+      if (missingMigrations.length > 0) {
+        errors.push(`Missing applied migrations: ${missingMigrations.join(", ")}`);
+      }
+
+      const versions = appliedRows.map((r) => r.version);
+      for (let i = 1; i < versions.length; i++) {
+        if (versions[i] - versions[i - 1] > 1) {
+          errors.push(
+            `Migration version gap between ${versions[i - 1]} and ${versions[i]}`,
+          );
+        }
+      }
+    } catch (err) {
+      errors.push(
+        `schema_migrations table is unreadable: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // Run registered migration verification hooks
+  for (const [name, hook] of failoverRecoveryMigrationHooks) {
+    try {
+      const result = hook(database);
+      const hookIssues =
+        typeof result === "string" ? [result] : Array.isArray(result) ? result : [];
+      for (const issue of hookIssues) {
+        errors.push(`${name}: ${issue}`);
+      }
+    } catch (err) {
+      errors.push(
+        `${name}: hook threw ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    missingTables,
+    missingColumns,
+    missingMigrations,
+    errors,
+    issues: errors,
+  };
+}
+
+export const verifyFailoverRecoverySchema = validateFailoverRecoverySchema;
+
+/**
+ * Throw FailoverRecoverySchemaError unless all required tables, columns,
+ * and migrations are present and healthy.
+ */
+export function assertFailoverRecoverySchemaValid(
+  targetDb?: Database.Database,
+): FailoverRecoverySchemaReport {
+  const report = validateFailoverRecoverySchema(targetDb);
+  if (report.valid) return report;
+
+  logger.error("indexer_failover_recovery schema verification failed", {
+    missingTables: report.missingTables,
+    missingColumns: report.missingColumns,
+    missingMigrations: report.missingMigrations,
+    errors: report.errors,
+  });
+
+  throw new FailoverRecoverySchemaError(
+    `indexer_failover_recovery: database schema is out of sync – ${report.errors.join("; ")}`,
+    report.errors,
+  );
+}
+
+export const assertFailoverRecoverySchemaReady = assertFailoverRecoverySchemaValid;
+
+export interface FailoverRecoveryStartOptions {
+  targetDb?: Database.Database;
+  autoInitialize?: boolean;
+}
+
+let failoverRecoveryStarted = false;
+let lastFailoverRecoverySchemaReport: FailoverRecoverySchemaReport | null = null;
+
+export function isFailoverRecoveryStarted(): boolean {
+  return failoverRecoveryStarted;
+}
+
+export function getFailoverRecoverySchemaReport(): FailoverRecoverySchemaReport | null {
+  return lastFailoverRecoverySchemaReport;
+}
+
+/**
+ * Start the indexer failover recovery component.
+ * Verifies schema integrity and fails fast (throws FailoverRecoverySchemaError)
+ * if the database state is out of sync.
+ */
+export function startFailoverRecovery(
+  options: FailoverRecoveryStartOptions = {},
+): FailoverRecoverySchemaReport {
+  const db = options.targetDb || getDb();
+
+  if (options.autoInitialize) {
+    initializeNodeHealthTables();
+  }
+
+  try {
+    const report = assertFailoverRecoverySchemaValid(db);
+    failoverRecoveryStarted = true;
+    lastFailoverRecoverySchemaReport = report;
+    logger.info("indexer_failover_recovery started", {
+      started: true,
+      valid: report.valid,
+    });
+    return report;
+  } catch (err) {
+    failoverRecoveryStarted = false;
+    lastFailoverRecoverySchemaReport = validateFailoverRecoverySchema(db);
+    throw err;
+  }
+}
+
+export const startFailoverRecoveryClient = startFailoverRecovery;
+
+export function stopFailoverRecovery(): void {
+  failoverRecoveryStarted = false;
+  lastFailoverRecoverySchemaReport = null;
+}
+
+export function resetFailoverRecovery(): void {
+  stopFailoverRecovery();
+  clearFailoverRecoveryMigrationHooks();
+}
+
