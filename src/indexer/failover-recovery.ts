@@ -1,5 +1,13 @@
 import Database from "better-sqlite3";
-import { getDb, getShippedMigrationVersions } from "./db.js";
+import { getDb, getLastIndexedLedger, getShippedMigrationVersions } from "./db.js";
+import {
+  validateLedgerRange,
+  resolveHistoricalLedgerRange,
+  chunkLedgerRange,
+  filterEventsToRange,
+  LedgerRangeValidationError,
+  type LedgerRange,
+} from "./ledger-range-tracker.js";
 import logger from "../utils/logger.js";
 
 /**
@@ -1293,6 +1301,295 @@ export function adjustFailoverRecoveryPollInterval(
 /** Aliases for the load-based adjustment entry point. */
 export const adjustFailoverRecoveryPollDelay = adjustFailoverRecoveryPollInterval;
 export const adjustIndexerFailoverRecoveryPollInterval = adjustFailoverRecoveryPollInterval;
+
+// ---------------------------------------------------------------------------
+// Dynamic historical sync ranges (#416)
+// ---------------------------------------------------------------------------
+//
+// indexer_failover_recovery accepts dynamic start/end ledger values for
+// custom historical event imports. The requested range is validated, split
+// into pages, and used to filter events before they are persisted, so callers
+// can backfill any window and verify correct per-block (per-ledger) event
+// counts. Historical imports never advance the live ledger pointer unless
+// `advanceLivePointer` is set.
+
+/** Inclusive historical range page size; matches the live poller RPC `limit`. */
+export const DEFAULT_FAILOVER_RECOVERY_HISTORICAL_PAGE_SIZE = 100;
+
+export { LedgerRangeValidationError };
+export const FailoverRecoveryLedgerRangeValidationError = LedgerRangeValidationError;
+export type FailoverRecoveryLedgerRange = LedgerRange;
+
+export interface FailoverRecoveryHistoricalRangeConfig {
+  startLedger?: number;
+  endLedger?: number;
+  pageSize?: number;
+}
+
+export interface FailoverRecoveryHistoricalRangeOptions {
+  startLedger?: number;
+  endLedger?: number;
+  /** Fallback start when no custom/env start is set (typically lastIndexed+1). */
+  defaultStart?: number;
+  /** Fallback end when no custom/env end is set. */
+  defaultEnd?: number;
+  /** Pre-fetched events; filtered to the resolved range before persist. */
+  events?: Array<{
+    contractId: string;
+    eventType: string;
+    ledgerSequence: number;
+    timestamp: number;
+    dataJson: string;
+  }>;
+  /** Per-page event source. Called once per chunk with the page's inclusive range. */
+  fetchEvents?: (page: LedgerRange) => Promise<
+    Array<{
+      contractId: string;
+      eventType: string;
+      ledgerSequence: number;
+      timestamp: number;
+      dataJson: string;
+    }>
+  > | Array<{
+    contractId: string;
+    eventType: string;
+    ledgerSequence: number;
+    timestamp: number;
+    dataJson: string;
+  }>;
+  pageSize?: number;
+  /**
+   * When true, advances `last_ledger_sequence` to the range end after a
+   * successful import. Defaults to false so live polling is unchanged.
+   */
+  advanceLivePointer?: boolean;
+}
+
+/** Number of events indexed for a single ledger ("block"). */
+export interface FailoverRecoveryLedgerEventCount {
+  ledgerSequence: number;
+  eventCount: number;
+}
+
+export interface FailoverRecoveryHistoricalImportResult {
+  range: LedgerRange;
+  pages: LedgerRange[];
+  /** Events accepted into the requested range (pre-persist). */
+  eventCount: number;
+  /** Rows actually written. */
+  insertedCount: number;
+  /** Rows skipped as already present (INSERT OR IGNORE). */
+  duplicateCount: number;
+  /** Distinct ledgers ("blocks") that contributed at least one event. */
+  processedLedgerCount: number;
+  /** Per-ledger event counts, ascending by ledger sequence. */
+  ledgerEventCounts: FailoverRecoveryLedgerEventCount[];
+  elapsedMs: number;
+}
+
+type FailoverRecoveryHistoricalEvent = {
+  contractId: string;
+  eventType: string;
+  ledgerSequence: number;
+  timestamp: number;
+  dataJson: string;
+};
+
+let failoverRecoveryHistoricalRangeConfig: FailoverRecoveryHistoricalRangeConfig = {};
+
+function failoverRecoveryDefaultHistoricalStart(): number {
+  const last = getLastIndexedLedger();
+  return last < 1 ? 1 : last + 1;
+}
+
+function validateOptionalFailoverLedger(name: string, value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new LedgerRangeValidationError(
+      `${name} must be a positive integer, received ${String(value)}`
+    );
+  }
+  return value;
+}
+
+/**
+ * Aggregate per-ledger ("block") event counts, ascending by ledger sequence.
+ * Tests assert against this to prove a custom range indexed every block.
+ */
+export function countFailoverRecoveryEventsByLedger(
+  events: Array<{ ledgerSequence?: unknown; ledger?: unknown }>
+): FailoverRecoveryLedgerEventCount[] {
+  const counts = new Map<number, number>();
+  for (const event of events) {
+    const raw = event?.ledgerSequence ?? event?.ledger;
+    const ledger = Number(raw);
+    if (!Number.isFinite(ledger)) continue;
+    counts.set(ledger, (counts.get(ledger) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([ledgerSequence, eventCount]) => ({ ledgerSequence, eventCount }));
+}
+
+/**
+ * Store optional historical start/end/pageSize for failover recovery imports.
+ * When both start and end are supplied they are validated as a pair.
+ */
+export function configureFailoverRecoveryHistoricalRange(
+  options: FailoverRecoveryHistoricalRangeConfig = {}
+): FailoverRecoveryHistoricalRangeConfig {
+  if (options.startLedger !== undefined && options.endLedger !== undefined) {
+    validateLedgerRange(options.startLedger, options.endLedger);
+  } else {
+    if (options.startLedger !== undefined) {
+      validateOptionalFailoverLedger("start ledger", options.startLedger);
+    }
+    if (options.endLedger !== undefined) {
+      validateOptionalFailoverLedger("end ledger", options.endLedger);
+    }
+  }
+  if (options.pageSize !== undefined) {
+    validateOptionalFailoverLedger("page size", options.pageSize);
+  }
+  failoverRecoveryHistoricalRangeConfig = { ...options };
+  return { ...failoverRecoveryHistoricalRangeConfig };
+}
+
+export function getFailoverRecoveryHistoricalRangeConfig(): FailoverRecoveryHistoricalRangeConfig {
+  return { ...failoverRecoveryHistoricalRangeConfig };
+}
+
+export function resetFailoverRecoveryHistoricalRangeConfig(): void {
+  failoverRecoveryHistoricalRangeConfig = {};
+}
+
+/**
+ * Resolve an inclusive historical range from explicit values, then the
+ * failover recovery configured start/end, then `LEDGER_RANGE_START` /
+ * `LEDGER_RANGE_END`, then live defaults (`last_indexed + 1` → provided
+ * default end).
+ *
+ * Throws `LedgerRangeValidationError` on non-integers, values below 1, or
+ * an inverted range (start > end).
+ */
+export function resolveFailoverRecoveryHistoricalRange(
+  options: FailoverRecoveryHistoricalRangeOptions = {}
+): LedgerRange {
+  return resolveHistoricalLedgerRange({
+    startLedger:
+      options.startLedger ?? failoverRecoveryHistoricalRangeConfig.startLedger,
+    endLedger:
+      options.endLedger ?? failoverRecoveryHistoricalRangeConfig.endLedger,
+    defaultStart: options.defaultStart ?? failoverRecoveryDefaultHistoricalStart(),
+    defaultEnd: options.defaultEnd ?? failoverRecoveryHistoricalRangeConfig.endLedger,
+  });
+}
+
+/**
+ * Import events for a custom inclusive historical ledger range through
+ * indexer_failover_recovery.
+ *
+ * The requested range is validated, split into pages, and used to filter
+ * events before they are persisted. Historical imports never advance the
+ * live ledger pointer unless `advanceLivePointer` is set, so live
+ * synchronization is unaffected.
+ */
+export async function importFailoverRecoveryHistoricalRange(
+  options: FailoverRecoveryHistoricalRangeOptions = {}
+): Promise<FailoverRecoveryHistoricalImportResult> {
+  const startedAt = performance.now();
+  const range = resolveFailoverRecoveryHistoricalRange(options);
+  const pageSize = validateOptionalFailoverLedger(
+    "page size",
+    options.pageSize ??
+      failoverRecoveryHistoricalRangeConfig.pageSize ??
+      DEFAULT_FAILOVER_RECOVERY_HISTORICAL_PAGE_SIZE
+  );
+  const pages = chunkLedgerRange(range, pageSize);
+
+  const collected: FailoverRecoveryHistoricalEvent[] = [];
+
+  if (options.fetchEvents) {
+    for (const page of pages) {
+      const pageEvents = await options.fetchEvents(page);
+      collected.push(
+        ...filterEventsToRange(
+          pageEvents as Parameters<typeof filterEventsToRange>[0],
+          page
+        )
+      );
+    }
+  } else if (options.events) {
+    collected.push(
+      ...filterEventsToRange(
+        options.events as Parameters<typeof filterEventsToRange>[0],
+        range
+      )
+    );
+  }
+
+  const db = getDb();
+  let insertedCount = 0;
+  let duplicateCount = 0;
+
+  const write = db.transaction(() => {
+    const insertStmt = db.prepare(`
+      INSERT OR IGNORE INTO events
+      (contract_id, event_type, ledger_sequence, timestamp, data_json)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+
+    for (const ev of collected) {
+      const result = insertStmt.run(
+        ev.contractId,
+        ev.eventType,
+        ev.ledgerSequence,
+        ev.timestamp,
+        ev.dataJson
+      );
+      if (result.changes > 0) {
+        insertedCount += 1;
+      } else {
+        duplicateCount += 1;
+      }
+    }
+
+    if (options.advanceLivePointer) {
+      db.prepare(
+        "UPDATE indexer_state SET value = ? WHERE key = 'last_ledger_sequence'"
+      ).run(range.endLedger.toString());
+    }
+  });
+  write();
+
+  const elapsedMs = Math.max(0, performance.now() - startedAt);
+  const ledgerEventCounts = countFailoverRecoveryEventsByLedger(collected);
+
+  logger.info("indexer_failover_recovery historical range imported", {
+    startLedger: range.startLedger,
+    endLedger: range.endLedger,
+    eventCount: collected.length,
+    insertedCount,
+    duplicateCount,
+    processedLedgerCount: ledgerEventCounts.length,
+  });
+
+  return {
+    range,
+    pages,
+    eventCount: collected.length,
+    insertedCount,
+    duplicateCount,
+    processedLedgerCount: ledgerEventCounts.length,
+    ledgerEventCounts,
+    elapsedMs,
+  };
+}
+
+/** Aliases matching sibling module naming. */
+export const resolveFailoverHistoricalRange = resolveFailoverRecoveryHistoricalRange;
+export const importFailoverHistoricalRange = importFailoverRecoveryHistoricalRange;
+export const countFailoverEventsByLedger = countFailoverRecoveryEventsByLedger;
+
 
 
 
