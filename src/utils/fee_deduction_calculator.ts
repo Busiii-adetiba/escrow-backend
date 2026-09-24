@@ -781,3 +781,55 @@ export function formatAmountForStorage(
 
   return { ok: true, value: `${negative ? "-" : ""}${wholePart}.${fractionalPart}` };
 }
+
+// ---------------------------------------------------------------------------
+// Asset ticker format fallback (#432)
+// ---------------------------------------------------------------------------
+//
+// formatAmountForStorage() takes an explicit decimals precision. Callers that
+// only have a Stellar asset ticker (not a precision) resolve one through this
+// lookup instead, which falls back to DEFAULT_ASSET_FORMAT_CONFIG for any
+// ticker this module doesn't recognize rather than failing the calculation.
+
+export interface AssetFormatConfig {
+  ticker: string;
+  decimals: number;
+}
+
+/** Fallback format config applied when a ticker is missing or unrecognized. */
+export const DEFAULT_ASSET_FORMAT_CONFIG: AssetFormatConfig = {
+  ticker: "UNKNOWN",
+  decimals: DEFAULT_DB_DECIMALS,
+};
+
+/** Format configs for Stellar asset tickers with a known, non-default precision. */
+const KNOWN_ASSET_FORMATS: Record<string, AssetFormatConfig> = {
+  XLM: { ticker: "XLM", decimals: 7 },
+  USDC: { ticker: "USDC", decimals: 7 },
+};
+
+/**
+ * Resolve the DB storage format config (decimal precision) for a Stellar
+ * asset ticker, falling back to DEFAULT_ASSET_FORMAT_CONFIG for missing or
+ * unrecognized tickers so callers always get a usable configuration.
+ */
+export function getAssetFormatConfig(ticker?: string | null): AssetFormatConfig {
+  if (!ticker) {
+    return DEFAULT_ASSET_FORMAT_CONFIG;
+  }
+  const normalized = ticker.trim().toUpperCase();
+  return KNOWN_ASSET_FORMATS[normalized] ?? DEFAULT_ASSET_FORMAT_CONFIG;
+}
+
+/**
+ * Format a raw bigint amount for DB storage using the precision configured
+ * for the given asset ticker, falling back to DEFAULT_ASSET_FORMAT_CONFIG
+ * when the ticker is missing or unrecognized.
+ */
+export function formatAmountForStorageByTicker(
+  amount: string | number | bigint,
+  ticker?: string | null
+): DbAmountFormatResult {
+  const { decimals } = getAssetFormatConfig(ticker);
+  return formatAmountForStorage(amount, decimals);
+}
