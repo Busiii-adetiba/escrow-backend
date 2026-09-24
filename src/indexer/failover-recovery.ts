@@ -1,4 +1,5 @@
-import { getDb } from "./db.js";
+import Database from "better-sqlite3";
+import { getDb, getShippedMigrationVersions } from "./db.js";
 import logger from "../utils/logger.js";
 
 /**
@@ -224,9 +225,15 @@ export async function recordNodeHealth(
     write(status);
     return true;
   } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error("Failed to record node health", {
       nodeUrl: status.nodeUrl,
-      error: err instanceof Error ? err.message : String(err),
+      error: errorMsg,
+    });
+    recordFailoverRecoveryFailure("health_record", {
+      operation: "recordNodeHealth",
+      nodeUrl: status.nodeUrl,
+      error: errorMsg,
     });
     return false;
   }
@@ -316,9 +323,15 @@ export async function recordNodeFailure(
 
     return mapHealthRow(write());
   } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error("Failed to record node failure", {
       nodeUrl,
-      error: err instanceof Error ? err.message : String(err),
+      error: errorMsg,
+    });
+    recordFailoverRecoveryFailure("node_failure", {
+      operation: "recordNodeFailure",
+      nodeUrl,
+      error: errorMsg,
     });
     return null;
   }
@@ -378,9 +391,15 @@ export async function recordNodeSuccess(
 
     return mapHealthRow(write());
   } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error("Failed to record node success", {
       nodeUrl,
-      error: err instanceof Error ? err.message : String(err),
+      error: errorMsg,
+    });
+    recordFailoverRecoveryFailure("health_record", {
+      operation: "recordNodeSuccess",
+      nodeUrl,
+      error: errorMsg,
     });
     return null;
   }
@@ -444,9 +463,15 @@ export async function failoverToNode(
       lastFailoverAt: row.last_failover_at,
     };
   } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error("Failed to fail over to node", {
       nodeUrl,
-      error: err instanceof Error ? err.message : String(err),
+      error: errorMsg,
+    });
+    recordFailoverRecoveryFailure("failover", {
+      operation: "failoverToNode",
+      nodeUrl,
+      error: errorMsg,
     });
     return null;
   }
@@ -491,6 +516,10 @@ export async function createFailoverServer<T>(
   const nodeUrl = selectHealthiestNode(nodeUrls);
   if (!nodeUrl) {
     logger.error("Cannot create failover server: no nodes configured");
+    recordFailoverRecoveryFailure("failover", {
+      operation: "createFailoverServer",
+      error: "Cannot create failover server: no nodes configured",
+    });
     return null;
   }
 
@@ -500,3 +529,547 @@ export async function createFailoverServer<T>(
 
   return { server: createServer(nodeUrl), nodeUrl };
 }
+
+// ---------------------------------------------------------------------------
+// Migration verification hooks (#417)
+// ---------------------------------------------------------------------------
+
+/**
+ * Tables and columns required by indexer_failover_recovery to operate safely.
+ */
+export const FAILOVER_RECOVERY_REQUIRED_SCHEMA: Record<string, string[]> = {
+  rpc_node_health: [
+    "node_url",
+    "is_healthy",
+    "failure_count",
+    "last_failure_at",
+    "last_success_at",
+    "next_retry_at",
+    "backoff_duration_ms",
+    "consecutive_successes",
+  ],
+  failover_state: [
+    "id",
+    "active_node_url",
+    "total_failovers",
+    "last_failover_at",
+  ],
+  node_failure_events: [
+    "id",
+    "node_url",
+    "error_message",
+    "retry_count",
+    "recovery_attempt_at",
+  ],
+  schema_migrations: ["version"],
+};
+
+export interface FailoverRecoverySchemaReport {
+  valid: boolean;
+  missingTables: string[];
+  missingColumns: Record<string, string[]>;
+  missingMigrations: number[];
+  errors: string[];
+  issues: string[];
+}
+
+export class FailoverRecoverySchemaError extends Error {
+  readonly issues: string[];
+
+  constructor(message: string, issues: string[] = []) {
+    super(message);
+    this.name = "FailoverRecoverySchemaError";
+    this.issues = issues;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export type FailoverRecoveryMigrationHook = (
+  db: Database.Database,
+) => string[] | string | void;
+
+const failoverRecoveryMigrationHooks = new Map<string, FailoverRecoveryMigrationHook>();
+
+export function registerFailoverRecoveryMigrationHook(
+  name: string,
+  hook: FailoverRecoveryMigrationHook,
+): void {
+  failoverRecoveryMigrationHooks.set(name, hook);
+}
+
+export function unregisterFailoverRecoveryMigrationHook(name: string): boolean {
+  return failoverRecoveryMigrationHooks.delete(name);
+}
+
+export function clearFailoverRecoveryMigrationHooks(): void {
+  failoverRecoveryMigrationHooks.clear();
+}
+
+export function getFailoverRecoveryMigrationHookNames(): string[] {
+  return [...failoverRecoveryMigrationHooks.keys()];
+}
+
+// Aliases for generic migration hook registration
+export const registerMigrationVerificationHook = registerFailoverRecoveryMigrationHook;
+export const registerMigrationHook = registerFailoverRecoveryMigrationHook;
+export const unregisterMigrationVerificationHook = unregisterFailoverRecoveryMigrationHook;
+export const clearMigrationVerificationHooks = clearFailoverRecoveryMigrationHooks;
+export const getMigrationVerificationHookNames = getFailoverRecoveryMigrationHookNames;
+
+/**
+ * Validate that every table, column, and migration required by indexer_failover_recovery
+ * is present and healthy. Reports all issues at once rather than failing on the first.
+ */
+export function validateFailoverRecoverySchema(
+  targetDb?: Database.Database,
+): FailoverRecoverySchemaReport {
+  const database = targetDb || getDb();
+  const missingTables: string[] = [];
+  const missingColumns: Record<string, string[]> = {};
+  const missingMigrations: number[] = [];
+  const errors: string[] = [];
+
+  for (const [table, requiredColumns] of Object.entries(
+    FAILOVER_RECOVERY_REQUIRED_SCHEMA,
+  )) {
+    const exists = database
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?")
+      .get(table);
+
+    if (!exists) {
+      missingTables.push(table);
+      errors.push(`Missing table: ${table}`);
+      continue;
+    }
+
+    const columns = (
+      database.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+        name: string;
+      }>
+    ).map((c) => c.name);
+
+    const absent = requiredColumns.filter((c) => !columns.includes(c));
+    if (absent.length > 0) {
+      missingColumns[table] = absent;
+      errors.push(`Missing columns in ${table}: ${absent.join(", ")}`);
+    }
+  }
+
+  // Verify migrations completeness and continuity when schema_migrations exists
+  if (!missingTables.includes("schema_migrations")) {
+    try {
+      const appliedRows = database
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .all() as Array<{ version: number }>;
+      const applied = new Set(appliedRows.map((r) => r.version));
+
+      for (const version of getShippedMigrationVersions()) {
+        if (!applied.has(version)) {
+          missingMigrations.push(version);
+        }
+      }
+
+      if (missingMigrations.length > 0) {
+        errors.push(`Missing applied migrations: ${missingMigrations.join(", ")}`);
+      }
+
+      const versions = appliedRows.map((r) => r.version);
+      for (let i = 1; i < versions.length; i++) {
+        if (versions[i] - versions[i - 1] > 1) {
+          errors.push(
+            `Migration version gap between ${versions[i - 1]} and ${versions[i]}`,
+          );
+        }
+      }
+    } catch (err) {
+      errors.push(
+        `schema_migrations table is unreadable: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // Run registered migration verification hooks
+  for (const [name, hook] of failoverRecoveryMigrationHooks) {
+    try {
+      const result = hook(database);
+      const hookIssues =
+        typeof result === "string" ? [result] : Array.isArray(result) ? result : [];
+      for (const issue of hookIssues) {
+        errors.push(`${name}: ${issue}`);
+      }
+    } catch (err) {
+      errors.push(
+        `${name}: hook threw ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    missingTables,
+    missingColumns,
+    missingMigrations,
+    errors,
+    issues: errors,
+  };
+}
+
+export const verifyFailoverRecoverySchema = validateFailoverRecoverySchema;
+
+/**
+ * Throw FailoverRecoverySchemaError unless all required tables, columns,
+ * and migrations are present and healthy.
+ */
+export function assertFailoverRecoverySchemaValid(
+  targetDb?: Database.Database,
+): FailoverRecoverySchemaReport {
+  const report = validateFailoverRecoverySchema(targetDb);
+  if (report.valid) return report;
+
+  logger.error("indexer_failover_recovery schema verification failed", {
+    missingTables: report.missingTables,
+    missingColumns: report.missingColumns,
+    missingMigrations: report.missingMigrations,
+    errors: report.errors,
+  });
+
+  throw new FailoverRecoverySchemaError(
+    `indexer_failover_recovery: database schema is out of sync – ${report.errors.join("; ")}`,
+    report.errors,
+  );
+}
+
+export const assertFailoverRecoverySchemaReady = assertFailoverRecoverySchemaValid;
+
+export interface FailoverRecoveryStartOptions {
+  targetDb?: Database.Database;
+  autoInitialize?: boolean;
+}
+
+let failoverRecoveryStarted = false;
+let lastFailoverRecoverySchemaReport: FailoverRecoverySchemaReport | null = null;
+
+export function isFailoverRecoveryStarted(): boolean {
+  return failoverRecoveryStarted;
+}
+
+export function getFailoverRecoverySchemaReport(): FailoverRecoverySchemaReport | null {
+  return lastFailoverRecoverySchemaReport;
+}
+
+/**
+ * Start the indexer failover recovery component.
+ * Verifies schema integrity and fails fast (throws FailoverRecoverySchemaError)
+ * if the database state is out of sync.
+ */
+export function startFailoverRecovery(
+  options: FailoverRecoveryStartOptions = {},
+): FailoverRecoverySchemaReport {
+  const db = options.targetDb || getDb();
+
+  if (options.autoInitialize) {
+    initializeNodeHealthTables();
+  }
+
+  try {
+    const report = assertFailoverRecoverySchemaValid(db);
+    failoverRecoveryStarted = true;
+    lastFailoverRecoverySchemaReport = report;
+    recordFailoverRecoverySuccess({ operation: "startFailoverRecovery" });
+    logger.info("indexer_failover_recovery started", {
+      started: true,
+      valid: report.valid,
+    });
+    return report;
+  } catch (err) {
+    failoverRecoveryStarted = false;
+    lastFailoverRecoverySchemaReport = validateFailoverRecoverySchema(db);
+    recordFailoverRecoveryFailure("schema", {
+      operation: "startFailoverRecovery",
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  }
+}
+
+export const startFailoverRecoveryClient = startFailoverRecovery;
+
+export function stopFailoverRecovery(): void {
+  failoverRecoveryStarted = false;
+  lastFailoverRecoverySchemaReport = null;
+}
+
+export function resetFailoverRecovery(): void {
+  stopFailoverRecovery();
+  clearFailoverRecoveryMigrationHooks();
+  resetFailoverRecoveryFailureMonitorState();
+}
+
+// ---------------------------------------------------------------------------
+// Consecutive failure and stall threshold alerting (#415)
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_FAILOVER_RECOVERY_FAILURE_THRESHOLD = 3;
+export const DEFAULT_FAILOVER_FAILURE_THRESHOLD = DEFAULT_FAILOVER_RECOVERY_FAILURE_THRESHOLD;
+
+export const DEFAULT_FAILOVER_RECOVERY_STALL_THRESHOLD_MS = 120_000;
+export const DEFAULT_FAILOVER_STALL_THRESHOLD_MS = DEFAULT_FAILOVER_RECOVERY_STALL_THRESHOLD_MS;
+
+export type FailoverRecoveryFailureType =
+  | "node_failure"
+  | "failover"
+  | "health_record"
+  | "schema"
+  | "retry"
+  | "stall"
+  | "operation"
+  | "query";
+
+export interface FailoverRecoveryFailureDetails {
+  error?: string;
+  operation?: string;
+  nodeUrl?: string;
+  elapsedMs?: number;
+  failureThreshold?: number;
+  [key: string]: unknown;
+}
+
+export interface FailoverRecoveryMonitorOptions {
+  name?: string;
+  failureThreshold?: number;
+  stallThresholdMs?: number;
+  repeatAlerts?: boolean;
+}
+
+export interface FailoverRecoveryAlertConfig {
+  failureThreshold: number;
+  stallThresholdMs: number;
+}
+
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) {
+    logger.warn("indexer_failover_recovery ignoring invalid threshold config", {
+      variable: name,
+      received: raw,
+      fallback,
+    });
+    return fallback;
+  }
+  return value;
+}
+
+export function getFailoverRecoveryAlertConfig(): FailoverRecoveryAlertConfig {
+  const failureThreshold =
+    process.env.FAILOVER_RECOVERY_FAILURE_THRESHOLD !== undefined
+      ? readPositiveIntEnv(
+          "FAILOVER_RECOVERY_FAILURE_THRESHOLD",
+          DEFAULT_FAILOVER_RECOVERY_FAILURE_THRESHOLD,
+        )
+      : process.env.INDEXER_FAILOVER_RECOVERY_FAILURE_THRESHOLD !== undefined
+        ? readPositiveIntEnv(
+            "INDEXER_FAILOVER_RECOVERY_FAILURE_THRESHOLD",
+            DEFAULT_FAILOVER_RECOVERY_FAILURE_THRESHOLD,
+          )
+        : readPositiveIntEnv(
+            "FAILOVER_FAILURE_THRESHOLD",
+            DEFAULT_FAILOVER_RECOVERY_FAILURE_THRESHOLD,
+          );
+
+  const stallThresholdMs =
+    process.env.FAILOVER_RECOVERY_STALL_THRESHOLD_MS !== undefined
+      ? readPositiveIntEnv(
+          "FAILOVER_RECOVERY_STALL_THRESHOLD_MS",
+          DEFAULT_FAILOVER_RECOVERY_STALL_THRESHOLD_MS,
+        )
+      : process.env.INDEXER_FAILOVER_RECOVERY_STALL_THRESHOLD_MS !== undefined
+        ? readPositiveIntEnv(
+            "INDEXER_FAILOVER_RECOVERY_STALL_THRESHOLD_MS",
+            DEFAULT_FAILOVER_RECOVERY_STALL_THRESHOLD_MS,
+          )
+        : readPositiveIntEnv(
+            "FAILOVER_STALL_THRESHOLD_MS",
+            DEFAULT_FAILOVER_RECOVERY_STALL_THRESHOLD_MS,
+          );
+
+  return { failureThreshold, stallThresholdMs };
+}
+
+export const getFailoverAlertConfig = getFailoverRecoveryAlertConfig;
+export const getIndexerFailoverRecoveryAlertConfig = getFailoverRecoveryAlertConfig;
+
+/**
+ * Tracks consecutive indexer_failover_recovery operation failures and stalls,
+ * raising warning alerts once configured thresholds are reached (#415).
+ */
+export class FailoverRecoveryFailureMonitor {
+  readonly component: string;
+  readonly failureThreshold: number;
+  readonly stallThresholdMs: number;
+  readonly repeatAlerts: boolean;
+
+  private consecutiveFailures = 0;
+  private lastSuccessfulAt: number | null = null;
+  private alertActive = false;
+  private stallAlerted = false;
+
+  constructor(options: FailoverRecoveryMonitorOptions = {}) {
+    const env = getFailoverRecoveryAlertConfig();
+    this.component = options.name ?? "indexer_failover_recovery";
+    this.failureThreshold = options.failureThreshold ?? env.failureThreshold;
+    this.stallThresholdMs = options.stallThresholdMs ?? env.stallThresholdMs;
+    this.repeatAlerts = options.repeatAlerts ?? false;
+  }
+
+  getConsecutiveFailures(): number {
+    return this.consecutiveFailures;
+  }
+
+  getLastSuccessfulAt(): number | null {
+    return this.lastSuccessfulAt;
+  }
+
+  isAlertActive(): boolean {
+    return this.alertActive;
+  }
+
+  getFailureThreshold(): number {
+    return this.failureThreshold;
+  }
+
+  getStallThresholdMs(): number {
+    return this.stallThresholdMs;
+  }
+
+  /**
+   * Record a failed indexer_failover_recovery operation.
+   * Logs an error every time and emits a warning alert when the
+   * consecutive-failure threshold is reached.
+   */
+  recordFailure(
+    failureType: FailoverRecoveryFailureType,
+    details: FailoverRecoveryFailureDetails = {},
+  ): number {
+    this.consecutiveFailures += 1;
+
+    const payload = {
+      component: this.component,
+      failureType,
+      operation: details.operation,
+      nodeUrl: details.nodeUrl,
+      consecutiveFailures: this.consecutiveFailures,
+      threshold: this.failureThreshold,
+      error: details.error,
+      elapsedMs: details.elapsedMs,
+    };
+
+    logger.error("indexer_failover_recovery operation failed", payload);
+
+    if (
+      this.consecutiveFailures === this.failureThreshold ||
+      (this.repeatAlerts && this.consecutiveFailures > this.failureThreshold)
+    ) {
+      this.alertActive = true;
+      logger.warn(
+        "indexer_failover_recovery alert: consecutive failure threshold reached",
+        {
+          ...payload,
+          action:
+            "Inspect RPC node health, failover state, and network connectivity; alerting clears automatically after the next successful operation.",
+        },
+      );
+    }
+
+    return this.consecutiveFailures;
+  }
+
+  /**
+   * Record a successful operation, clearing any active failure or stall alert.
+   */
+  recordSuccess(details?: { operation?: string; nodeUrl?: string }): void {
+    const hadFailures = this.consecutiveFailures > 0 || this.alertActive;
+    this.consecutiveFailures = 0;
+    this.lastSuccessfulAt = Date.now();
+    if (hadFailures) {
+      logger.info(
+        "indexer_failover_recovery recovered after consecutive failures",
+        {
+          component: this.component,
+          operation: details?.operation,
+          nodeUrl: details?.nodeUrl,
+        },
+      );
+    }
+    this.alertActive = false;
+    this.stallAlerted = false;
+  }
+
+  /**
+   * Warn when no successful operation has completed inside the stall window.
+   */
+  checkStall(): boolean {
+    if (this.lastSuccessfulAt === null) return false;
+    const elapsedMs = Date.now() - this.lastSuccessfulAt;
+    if (elapsedMs <= this.stallThresholdMs) return false;
+    if (this.stallAlerted) return true;
+
+    this.stallAlerted = true;
+    logger.warn("indexer_failover_recovery alert: stall threshold reached", {
+      component: this.component,
+      failureType: "stall" as const,
+      consecutiveFailures: this.consecutiveFailures,
+      threshold: this.failureThreshold,
+      stallThresholdMs: this.stallThresholdMs,
+      elapsedMs,
+      action:
+        "No successful indexer_failover_recovery operation within the stall window; inspect RPC nodes, network connectivity, and indexer health.",
+    });
+    return true;
+  }
+
+  reset(): void {
+    this.consecutiveFailures = 0;
+    this.lastSuccessfulAt = null;
+    this.alertActive = false;
+    this.stallAlerted = false;
+  }
+}
+
+export const IndexerFailoverRecoveryFailureMonitor = FailoverRecoveryFailureMonitor;
+
+let defaultFailoverRecoveryFailureMonitor = new FailoverRecoveryFailureMonitor();
+
+export function getFailoverRecoveryFailureMonitor(): FailoverRecoveryFailureMonitor {
+  return defaultFailoverRecoveryFailureMonitor;
+}
+
+export const getIndexerFailoverRecoveryFailureMonitor = getFailoverRecoveryFailureMonitor;
+
+export function resetFailoverRecoveryFailureMonitorState(): void {
+  defaultFailoverRecoveryFailureMonitor = new FailoverRecoveryFailureMonitor();
+}
+
+export const resetFailoverRecoveryAlertState = resetFailoverRecoveryFailureMonitorState;
+export const resetIndexerFailoverRecoveryFailureState = resetFailoverRecoveryFailureMonitorState;
+
+export function recordFailoverRecoveryFailure(
+  failureType: FailoverRecoveryFailureType,
+  details?: FailoverRecoveryFailureDetails,
+): number {
+  return defaultFailoverRecoveryFailureMonitor.recordFailure(failureType, details);
+}
+
+export function recordFailoverRecoverySuccess(details?: {
+  operation?: string;
+  nodeUrl?: string;
+}): void {
+  defaultFailoverRecoveryFailureMonitor.recordSuccess(details);
+}
+
+export function checkFailoverRecoveryStall(): boolean {
+  return defaultFailoverRecoveryFailureMonitor.checkStall();
+}
+
+
