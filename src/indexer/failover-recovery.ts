@@ -1072,4 +1072,227 @@ export function checkFailoverRecoveryStall(): boolean {
   return defaultFailoverRecoveryFailureMonitor.checkStall();
 }
 
+// ---------------------------------------------------------------------------
+// Dynamic poller throttling parameters (#418)
+// ---------------------------------------------------------------------------
+//
+// The failover recovery poll loop sizes its wait delay from the ledger
+// processing load observed in the most recent cycle, mirroring the
+// indexer_runner / poller throttles (#256, #265). Idle networks back off so
+// the loop stops hammering healthy RPC nodes, while active networks pull the
+// delay back toward the minimum.
+
+/** Configured throttle parameters sizing the failover recovery poll wait delay. */
+export interface FailoverRecoveryThrottleParameters {
+  /** Interval the poll loop starts from (and resets to on activity). */
+  baseIntervalMs: number;
+  /** Floor the delay is pulled toward under load. */
+  minIntervalMs: number;
+  /** Ceiling idle backoff can never exceed. */
+  maxIntervalMs: number;
+  /** Factor applied to the delay on an idle poll once the threshold is met. */
+  idleMultiplier: number;
+  /** Consecutive idle polls required before the delay starts growing. */
+  idleThresholdCycles: number;
+  /** Factor applied to the delay on a loaded poll (must be < 1). */
+  loadDecreaseFactor: number;
+}
+
+/** Snapshot of the current failover recovery throttle state. */
+export interface FailoverRecoveryThrottleState {
+  /** Current effective poll wait delay in ms. */
+  currentIntervalMs: number;
+  /** Event count observed during the most recent poll adjustment. */
+  lastProcessedEventCount: number;
+  /** Consecutive idle (zero-event) polls so far. */
+  idleCycles: number;
+  /** Timestamp of the most recent throttle adjustment. */
+  lastLoadAdjustmentAt: number;
+}
+
+function readThrottleIntEnv(
+  names: string[],
+  fallback: number
+): number {
+  for (const name of names) {
+    const raw = process.env[name];
+    if (raw === undefined || raw === "") continue;
+    const value = Number(raw);
+    if (Number.isInteger(value) && value >= 1) return value;
+  }
+  return fallback;
+}
+
+function readThrottleFloatEnv(
+  names: string[],
+  fallback: number
+): number {
+  for (const name of names) {
+    const raw = process.env[name];
+    if (raw === undefined || raw === "") continue;
+    const value = Number(raw);
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+  return fallback;
+}
+
+const FAILOVER_RECOVERY_BASE_POLL_INTERVAL_MS = readThrottleIntEnv(
+  [
+    "FAILOVER_RECOVERY_BASE_POLL_INTERVAL_MS",
+    "FAILOVER_RECOVERY_POLL_INTERVAL_MS",
+    "INDEXER_FAILOVER_RECOVERY_POLL_INTERVAL_MS",
+    "POLL_INTERVAL_MS",
+  ],
+  15000
+);
+const FAILOVER_RECOVERY_MIN_POLL_INTERVAL_MS = readThrottleIntEnv(
+  [
+    "FAILOVER_RECOVERY_MIN_POLL_INTERVAL_MS",
+    "FAILOVER_RECOVERY_MIN_INTERVAL_MS",
+    "INDEXER_FAILOVER_RECOVERY_MIN_POLL_INTERVAL_MS",
+  ],
+  5000
+);
+const FAILOVER_RECOVERY_MAX_POLL_INTERVAL_MS = readThrottleIntEnv(
+  [
+    "FAILOVER_RECOVERY_MAX_POLL_INTERVAL_MS",
+    "FAILOVER_RECOVERY_MAX_INTERVAL_MS",
+    "INDEXER_FAILOVER_RECOVERY_MAX_POLL_INTERVAL_MS",
+  ],
+  60000
+);
+const FAILOVER_RECOVERY_IDLE_MULTIPLIER = readThrottleFloatEnv(
+  [
+    "FAILOVER_RECOVERY_IDLE_MULTIPLIER",
+    "INDEXER_FAILOVER_RECOVERY_IDLE_MULTIPLIER",
+  ],
+  2
+);
+const FAILOVER_RECOVERY_IDLE_THRESHOLD_CYCLES = readThrottleIntEnv(
+  [
+    "FAILOVER_RECOVERY_IDLE_THRESHOLD_CYCLES",
+    "FAILOVER_RECOVERY_IDLE_THRESHOLD",
+    "INDEXER_FAILOVER_RECOVERY_IDLE_THRESHOLD_CYCLES",
+  ],
+  3
+);
+const FAILOVER_RECOVERY_LOAD_DECREASE_FACTOR = readThrottleFloatEnv(
+  [
+    "FAILOVER_RECOVERY_LOAD_DECREASE_FACTOR",
+    "INDEXER_FAILOVER_RECOVERY_LOAD_DECREASE_FACTOR",
+  ],
+  0.5
+);
+
+let failoverRecoveryThrottleState: FailoverRecoveryThrottleState = {
+  currentIntervalMs: FAILOVER_RECOVERY_BASE_POLL_INTERVAL_MS,
+  lastProcessedEventCount: 0,
+  idleCycles: 0,
+  lastLoadAdjustmentAt: Date.now(),
+};
+
+/** Snapshot of the configured failover recovery throttle parameters (read-only). */
+export function getFailoverRecoveryThrottleParameters(): FailoverRecoveryThrottleParameters {
+  return {
+    baseIntervalMs: FAILOVER_RECOVERY_BASE_POLL_INTERVAL_MS,
+    minIntervalMs: FAILOVER_RECOVERY_MIN_POLL_INTERVAL_MS,
+    maxIntervalMs: FAILOVER_RECOVERY_MAX_POLL_INTERVAL_MS,
+    idleMultiplier: FAILOVER_RECOVERY_IDLE_MULTIPLIER,
+    idleThresholdCycles: FAILOVER_RECOVERY_IDLE_THRESHOLD_CYCLES,
+    loadDecreaseFactor: FAILOVER_RECOVERY_LOAD_DECREASE_FACTOR,
+  };
+}
+
+/** Snapshot of the current failover recovery throttle state (read-only copy). */
+export function getFailoverRecoveryThrottleState(): FailoverRecoveryThrottleState {
+  return { ...failoverRecoveryThrottleState };
+}
+
+/** Reset the failover recovery throttle state to defaults (useful for tests). */
+export function resetFailoverRecoveryThrottleState(): void {
+  failoverRecoveryThrottleState = {
+    currentIntervalMs: FAILOVER_RECOVERY_BASE_POLL_INTERVAL_MS,
+    lastProcessedEventCount: 0,
+    idleCycles: 0,
+    lastLoadAdjustmentAt: Date.now(),
+  };
+}
+
+/** Poll wait delay the failover recovery loop should use before the next cycle. */
+export function getFailoverRecoveryPollDelayMs(): number {
+  return failoverRecoveryThrottleState.currentIntervalMs;
+}
+
+/** Alias matching the poller/db getter naming. */
+export const getFailoverRecoveryCurrentPollIntervalMs = getFailoverRecoveryPollDelayMs;
+export const getCurrentFailoverRecoveryPollIntervalMs = getFailoverRecoveryPollDelayMs;
+
+/**
+ * Next failover recovery poll delay given the current one and whether the
+ * last poll saw activity.
+ *
+ * Idle polls back off geometrically up to the configured maximum; the first
+ * active poll drops straight back to the base interval. Pure function so the
+ * backoff curve can be reasoned about (and tested) without running the loop.
+ */
+export function nextFailoverRecoveryPollIntervalMs(
+  currentIntervalMs: number,
+  sawActivity: boolean
+): number {
+  if (sawActivity) return FAILOVER_RECOVERY_BASE_POLL_INTERVAL_MS;
+  return Math.min(
+    currentIntervalMs * FAILOVER_RECOVERY_IDLE_MULTIPLIER,
+    FAILOVER_RECOVERY_MAX_POLL_INTERVAL_MS
+  );
+}
+
+/**
+ * Adjust the failover recovery poll wait delay based on the ledger
+ * processing load observed in the most recent poll cycle (#418).
+ *
+ * A poll that processed zero events means the network is idle: once
+ * `idleThresholdCycles` consecutive idle polls have been seen the wait delay
+ * backs off (multiplied by `idleMultiplier`, capped at `maxIntervalMs`) so
+ * polling slows down while idle.
+ *
+ * A poll that processed any events means the network is active: idle cycles
+ * are cleared and the delay is pulled back toward `minIntervalMs`.
+ *
+ * @param processedEventCount - Number of events handled in the last poll.
+ * @returns Updated throttle state snapshot.
+ */
+export function adjustFailoverRecoveryPollInterval(
+  processedEventCount: number
+): FailoverRecoveryThrottleState {
+  const state = failoverRecoveryThrottleState;
+  state.lastProcessedEventCount = processedEventCount;
+
+  if (processedEventCount === 0) {
+    // Idle network → the polling wait delay increases once enough
+    // consecutive idle cycles have been observed.
+    state.idleCycles += 1;
+    if (state.idleCycles >= FAILOVER_RECOVERY_IDLE_THRESHOLD_CYCLES) {
+      state.currentIntervalMs = Math.min(
+        state.currentIntervalMs * FAILOVER_RECOVERY_IDLE_MULTIPLIER,
+        FAILOVER_RECOVERY_MAX_POLL_INTERVAL_MS
+      );
+    }
+  } else {
+    // Active network → pull the wait delay back toward the minimum.
+    state.idleCycles = 0;
+    state.currentIntervalMs = Math.max(
+      FAILOVER_RECOVERY_MIN_POLL_INTERVAL_MS,
+      Math.floor(state.currentIntervalMs * FAILOVER_RECOVERY_LOAD_DECREASE_FACTOR)
+    );
+  }
+
+  state.lastLoadAdjustmentAt = Date.now();
+  return { ...state };
+}
+
+/** Aliases for the load-based adjustment entry point. */
+export const adjustFailoverRecoveryPollDelay = adjustFailoverRecoveryPollInterval;
+export const adjustIndexerFailoverRecoveryPollInterval = adjustFailoverRecoveryPollInterval;
+
+
 
