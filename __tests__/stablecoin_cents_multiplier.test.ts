@@ -278,12 +278,32 @@ describe("stablecoin_cents_multiplier overflow validation and decimal rounding",
         }
       });
 
-      it("supports configurable 'ceil' rounding mode", () => {
+      it("supports configurable 'ceil' rounding mode (positive and negative values)", () => {
         // 10 / 3 = 3.333 -> ceil rounds up to 4
-        const result = applyStablecoinCentsMultiplier("10", "1", "3", "ceil");
-        expect(result.ok).toBe(true);
-        if (result.ok) {
-          expect(result.value).toBe(4n);
+        const resPos = applyStablecoinCentsMultiplier("10", "1", "3", "ceil");
+        expect(resPos.ok).toBe(true);
+        if (resPos.ok) {
+          expect(resPos.value).toBe(4n);
+        }
+
+        // -10 / 3 = -3.333 -> ceil rounds towards +infinity to -3
+        const resNeg = applyStablecoinCentsMultiplier("-10", "1", "3", "ceil");
+        expect(resNeg.ok).toBe(true);
+        if (resNeg.ok) {
+          expect(resNeg.value).toBe(-3n);
+        }
+
+        // Exact division cases remain unchanged
+        const resPosExact = applyStablecoinCentsMultiplier("9", "1", "3", "ceil");
+        expect(resPosExact.ok).toBe(true);
+        if (resPosExact.ok) {
+          expect(resPosExact.value).toBe(3n);
+        }
+
+        const resNegExact = applyStablecoinCentsMultiplier("-9", "1", "3", "ceil");
+        expect(resNegExact.ok).toBe(true);
+        if (resNegExact.ok) {
+          expect(resNegExact.value).toBe(-3n);
         }
       });
 

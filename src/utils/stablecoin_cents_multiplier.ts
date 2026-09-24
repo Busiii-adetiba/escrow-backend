@@ -159,7 +159,7 @@ function roundIntegerDivision(
   }
 
   if (mode === "ceil") {
-    return q + sign;
+    return N > 0n ? q + 1n : q;
   }
 
   if (mode === "half-up") {
