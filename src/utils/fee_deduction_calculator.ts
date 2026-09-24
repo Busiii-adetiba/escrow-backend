@@ -722,3 +722,62 @@ export function calculateFeeDeductionHalfEven(
 
   return { ok: true, feeAmount, netAmount };
 }
+
+// ---------------------------------------------------------------------------
+// DB storage formatting (#433)
+// ---------------------------------------------------------------------------
+//
+// Calculated amounts are bigints internally, but rows written to a DB
+// precision column need a fixed-width decimal string: unlike a human display
+// format, trailing zeros are kept (not trimmed) so every row has the same
+// number of fractional digits matching the column's declared precision.
+
+/** Default decimal precision (Stellar classic/SAC asset precision) used when no explicit precision is given. */
+export const DEFAULT_DB_DECIMALS = 7;
+
+export type DbAmountFormatResult =
+  | { ok: true; value: string }
+  | { ok: false; error: string; code: FeeCalculatorErrorCode };
+
+/**
+ * Format a raw bigint amount as a fixed-precision decimal string suitable
+ * for writing to a DB column with a fixed number of fractional digits.
+ * Uses string arithmetic throughout so no precision is lost the way it
+ * would be by round-tripping the amount through a JS number/float column.
+ */
+export function formatAmountForStorage(
+  amount: string | number | bigint,
+  decimals: number = DEFAULT_DB_DECIMALS
+): DbAmountFormatResult {
+  const amountCheck = validateAmount(amount, "amount");
+  if (!amountCheck.ok) {
+    return amountCheck;
+  }
+
+  if (
+    typeof decimals !== "number" ||
+    !Number.isFinite(decimals) ||
+    !Number.isInteger(decimals) ||
+    decimals < 0
+  ) {
+    return {
+      ok: false,
+      error: "decimals must be a non-negative finite integer",
+      code: ERROR_CODES.INVALID_AMOUNT,
+    };
+  }
+
+  const value = amountCheck.value;
+  const negative = value < 0n;
+  const digits = (negative ? -value : value).toString();
+
+  if (decimals === 0) {
+    return { ok: true, value: `${negative ? "-" : ""}${digits}` };
+  }
+
+  const padded = digits.padStart(decimals + 1, "0");
+  const wholePart = padded.slice(0, padded.length - decimals);
+  const fractionalPart = padded.slice(padded.length - decimals);
+
+  return { ok: true, value: `${negative ? "-" : ""}${wholePart}.${fractionalPart}` };
+}
