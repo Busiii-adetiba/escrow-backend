@@ -454,6 +454,13 @@ export function checkFeeShareCalculation(
   if (!grossCheck.ok) {
     return grossCheck;
   }
+  if (grossCheck.value < 0n) {
+    return {
+      ok: false,
+      error: "grossAmount must be non-negative",
+      code: ERROR_CODES.INVALID_AMOUNT,
+    };
+  }
 
   let totalFee = 0n;
 
@@ -461,6 +468,13 @@ export function checkFeeShareCalculation(
     const shareCheck = validateAmount(feeShares[i], `feeShares[${i}]`);
     if (!shareCheck.ok) {
       return shareCheck;
+    }
+    if (shareCheck.value < 0n) {
+      return {
+        ok: false,
+        error: `feeShares[${i}] must be non-negative`,
+        code: ERROR_CODES.INVALID_AMOUNT,
+      };
     }
 
     const next = totalFee + shareCheck.value;
@@ -488,6 +502,13 @@ export function checkFeeShareCalculation(
     const expectedCheck = validateAmount(expectedTotalFee, "expectedTotalFee");
     if (!expectedCheck.ok) {
       return expectedCheck;
+    }
+    if (expectedCheck.value < 0n) {
+      return {
+        ok: false,
+        error: "expectedTotalFee must be non-negative",
+        code: ERROR_CODES.INVALID_AMOUNT,
+      };
     }
     isValid = totalFee === expectedCheck.value;
   }
