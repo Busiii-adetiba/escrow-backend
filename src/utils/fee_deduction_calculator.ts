@@ -25,6 +25,7 @@ export const ERROR_CODES = {
   INVALID_SHARES: "FEE_CALCULATOR_INVALID_SHARES",
   CALCULATION_OVERFLOW: "FEE_CALCULATOR_OVERFLOW",
   FEE_EXCEEDS_AMOUNT: "FEE_CALCULATOR_FEE_EXCEEDS_AMOUNT",
+  RATE_LIMITED: "FEE_CALCULATOR_RATE_LIMITED",
   // Compatibility aliases
   OVERFLOW_EXCESSIVE_DIGITS: "OVERFLOW_EXCESSIVE_DIGITS",
   OVERFLOW_INVALID_AMOUNT: "OVERFLOW_INVALID_AMOUNT",
@@ -81,6 +82,43 @@ export type FeeShareCheckOutcome =
 function digitCount(normalized: string): number {
   const digits = normalized.replace(/^-/, "").replace(/^0+(?=\d)/, "");
   return digits.length === 0 ? 1 : digits.length;
+}
+
+/** Max calculator calls allowed per rate-limit window before calls are rejected. */
+export const RATE_LIMIT_MAX_CALLS = 1000;
+
+/** Rate-limit window size, in milliseconds. */
+export const RATE_LIMIT_WINDOW_MS = 60_000;
+
+let rateLimitWindowStart = Date.now();
+let rateLimitCallCount = 0;
+
+/**
+ * Guard against excessive fee-calculation call volume within a rolling
+ * window. This module has no HTTP route of its own, so callers get the
+ * same 429-style rejection semantics used by the app's request-level rate
+ * limiters, scoped to this module's own call volume instead of a client IP.
+ */
+function checkFeeCalculatorRateLimit():
+  | { ok: true }
+  | { ok: false; error: string; code: FeeCalculatorErrorCode } {
+  const now = Date.now();
+  if (now - rateLimitWindowStart >= RATE_LIMIT_WINDOW_MS) {
+    rateLimitWindowStart = now;
+    rateLimitCallCount = 0;
+  }
+
+  rateLimitCallCount += 1;
+
+  if (rateLimitCallCount > RATE_LIMIT_MAX_CALLS) {
+    return {
+      ok: false,
+      error: `fee calculator rate limit exceeded: max ${RATE_LIMIT_MAX_CALLS} calls per ${RATE_LIMIT_WINDOW_MS}ms`,
+      code: ERROR_CODES.RATE_LIMITED,
+    };
+  }
+
+  return { ok: true };
 }
 
 /**
@@ -228,6 +266,11 @@ export function calculateFeeDeduction(
   feeRate: string | number | bigint,
   scale: string | number | bigint = DEFAULT_FEE_SCALE
 ): FeeDeductionOutcome {
+  const rateLimitCheck = checkFeeCalculatorRateLimit();
+  if (!rateLimitCheck.ok) {
+    return rateLimitCheck;
+  }
+
   const grossCheck = validateAmount(grossAmount, "grossAmount");
   if (!grossCheck.ok) {
     return grossCheck;
@@ -300,6 +343,11 @@ export function calculateFeeShares(
   totalFee: string | number | bigint,
   shares: number[]
 ): FeeShareOutcome {
+  const rateLimitCheck = checkFeeCalculatorRateLimit();
+  if (!rateLimitCheck.ok) {
+    return rateLimitCheck;
+  }
+
   const totalCheck = validateAmount(totalFee, "totalFee");
   if (!totalCheck.ok) {
     return totalCheck;
@@ -368,6 +416,11 @@ export function calculateFeeShareDeductions(
   grossAmount: string | number | bigint,
   shares: number[]
 ): FeeShareDeductionOutcome {
+  const rateLimitCheck = checkFeeCalculatorRateLimit();
+  if (!rateLimitCheck.ok) {
+    return rateLimitCheck;
+  }
+
   const grossCheck = validateAmount(grossAmount, "grossAmount");
   if (!grossCheck.ok) {
     return grossCheck;
@@ -638,6 +691,11 @@ export function calculateFeeDeductionHalfEven(
   baseAmount: string | number | bigint,
   feeRateBps: number
 ): FeeDeductionHalfEvenOutcome {
+  const rateLimitCheck = checkFeeCalculatorRateLimit();
+  if (!rateLimitCheck.ok) {
+    return rateLimitCheck;
+  }
+
   const base = validateBaseAmount(baseAmount);
   if (!base.ok) {
     return base;
