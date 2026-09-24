@@ -15,6 +15,60 @@ export interface StablecoinCentsMultiplierOptions {
 }
 
 /**
+ * Warning codes emitted when a parameter is malformed or mismatched.
+ *
+ * These codes let callers distinguish calculation exceptions without having to
+ * parse human-readable error messages, and keep the response body shape stable
+ * across the different failure modes.
+ */
+export type StablecoinCentsMultiplierWarningCode =
+  | 'INVALID_DECIMALS'
+  | 'EMPTY_AMOUNT'
+  | 'INVALID_AMOUNT_FORMAT'
+  | 'AMOUNT_OUT_OF_RANGE';
+
+/**
+ * Structured warning describing a single parameter exception.
+ */
+export interface StablecoinCentsMultiplierWarning {
+  /** Stable machine-readable code for the exception. */
+  code: StablecoinCentsMultiplierWarningCode;
+  /** Name of the parameter that triggered the exception. */
+  parameter: 'amount' | 'decimals';
+  /** Human-readable description of the exception. */
+  message: string;
+}
+
+/**
+ * Error thrown in strict mode that carries the structured warning payload so
+ * that mismatched parameter structures can be reported consistently.
+ */
+export class StablecoinCentsMultiplierError extends Error {
+  public readonly code: StablecoinCentsMultiplierWarningCode;
+  public readonly parameter: 'amount' | 'decimals';
+  public readonly warnings: StablecoinCentsMultiplierWarning[];
+
+  constructor(warning: StablecoinCentsMultiplierWarning) {
+    super(warning.message);
+    this.name = 'StablecoinCentsMultiplierError';
+    this.code = warning.code;
+    this.parameter = warning.parameter;
+    this.warnings = [warning];
+  }
+}
+
+/**
+ * Builds the structured warning for a given exception code.
+ */
+function buildWarning(
+  code: StablecoinCentsMultiplierWarningCode,
+  parameter: 'amount' | 'decimals',
+  message: string,
+): StablecoinCentsMultiplierWarning {
+  return { code, parameter, message };
+}
+
+/**
  * Multiplies a stablecoin amount by 100 and returns the integer number of
  * cents. The multiplication is performed on the decimal string representation
  * so that no binary floating point rounding is introduced.
@@ -31,8 +85,13 @@ export function stablecoin_cents_multiplier(
   const { decimals = 2, strict = false } = options;
 
   if (decimals < 0 || !Number.isInteger(decimals)) {
+    const warning = buildWarning(
+      'INVALID_DECIMALS',
+      'decimals',
+      `decimals must be a non-negative integer, received ${decimals}`,
+    );
     if (strict) {
-      throw new RangeError(`decimals must be a non-negative integer, received ${decimals}`);
+      throw new StablecoinCentsMultiplierError(warning);
     }
     return null;
   }
@@ -41,16 +100,22 @@ export function stablecoin_cents_multiplier(
   const trimmed = raw.trim();
 
   if (trimmed === '') {
+    const warning = buildWarning('EMPTY_AMOUNT', 'amount', 'amount must not be empty');
     if (strict) {
-      throw new TypeError('amount must not be empty');
+      throw new StablecoinCentsMultiplierError(warning);
     }
     return null;
   }
 
   const match = /^([+-]?)(\d*)(?:\.(\d*))?$/.exec(trimmed);
   if (!match || (match[2] === '' && (match[3] === undefined || match[3] === ''))) {
+    const warning = buildWarning(
+      'INVALID_AMOUNT_FORMAT',
+      'amount',
+      `amount is not a valid decimal string: ${raw}`,
+    );
     if (strict) {
-      throw new TypeError(`amount is not a valid decimal string: ${raw}`);
+      throw new StablecoinCentsMultiplierError(warning);
     }
     return null;
   }
@@ -67,8 +132,13 @@ export function stablecoin_cents_multiplier(
   const cents = Number(centsDigits);
 
   if (!Number.isSafeInteger(cents)) {
+    const warning = buildWarning(
+      'AMOUNT_OUT_OF_RANGE',
+      'amount',
+      `amount exceeds safe integer range: ${raw}`,
+    );
     if (strict) {
-      throw new RangeError(`amount exceeds safe integer range: ${raw}`);
+      throw new StablecoinCentsMultiplierError(warning);
     }
     return null;
   }
