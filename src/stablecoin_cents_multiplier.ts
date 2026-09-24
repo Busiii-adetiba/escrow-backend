@@ -165,3 +165,78 @@ export function exportCentsTable(
 
   return `${lines.join('\n')}\n`;
 }
+
+/**
+ * A single verified numeric expectation for the cents multiplier math.
+ *
+ * Each case pairs a human-readable `amount` with the exact integer `cents`
+ * value that the conversion helpers must produce, so the math can be checked
+ * against hand-calculated outcomes.
+ */
+export interface CentsMultiplierCase {
+  /** Human-readable stablecoin amount. */
+  amount: number;
+  /** Expected integer cents value for the default (2 decimal) multiplier. */
+  cents: number;
+  /** Optional non-default decimal precision for this case. */
+  decimals?: number;
+  /** Optional rounding mode for this case. */
+  rounding?: 'floor' | 'ceil' | 'round';
+}
+
+/**
+ * Verified numeric test data for `stablecoin_cents_multiplier`.
+ *
+ * The values below are hand-calculated against the default 2-decimal
+ * multiplier (100) unless a case overrides `decimals`/`rounding`.
+ */
+export const CENTS_MULTIPLIER_CASES: CentsMultiplierCase[] = [
+  // Typical values: amount * 100.
+  { amount: 0, cents: 0 },
+  { amount: 1, cents: 100 },
+  { amount: 1.5, cents: 150 },
+  { amount: 12.34, cents: 1234 },
+  { amount: 99.99, cents: 9999 },
+  { amount: 100, cents: 10000 },
+  { amount: 1234.56, cents: 123456 },
+  // Boundary values.
+  { amount: 0.01, cents: 1 },
+  { amount: 0.1, cents: 10 },
+  { amount: 0.001, cents: 0 },
+  { amount: 0.005, cents: 1 },
+  { amount: 0.004, cents: 0 },
+  // Precision-sensitive inputs.
+  { amount: 0.1 + 0.2, cents: 30 },
+  { amount: 1.005, cents: 100 },
+  { amount: 2.675, cents: 268 },
+  // Non-default decimal precision (6-decimal stablecoin).
+  { amount: 1, cents: 1000000, decimals: 6 },
+  { amount: 0.000001, cents: 1, decimals: 6 },
+  { amount: 12.345678, cents: 12345678, decimals: 6 },
+  // Explicit rounding modes.
+  { amount: 1.005, cents: 100, rounding: 'floor' },
+  { amount: 1.001, cents: 101, rounding: 'ceil' },
+  { amount: 1.004, cents: 100, rounding: 'round' },
+];
+
+/**
+ * Compute the expected integer cents value for a verified case.
+ *
+ * This mirrors the documented math (`amount * 10^decimals` with the selected
+ * rounding mode) so tests can assert the helper output against an independent
+ * calculation rather than a hard-coded duplicate.
+ */
+export function expectedCents(testCase: CentsMultiplierCase): number {
+  const decimals = testCase.decimals ?? DEFAULT_DECIMALS;
+  const rounding = testCase.rounding ?? 'round';
+  const scaled = testCase.amount * centsMultiplier(decimals);
+  switch (rounding) {
+    case 'floor':
+      return Math.floor(scaled);
+    case 'ceil':
+      return Math.ceil(scaled);
+    case 'round':
+    default:
+      return Math.round(scaled);
+  }
+}
