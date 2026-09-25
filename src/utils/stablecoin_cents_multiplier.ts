@@ -21,11 +21,8 @@ export const ERROR_CODES = {
   INVALID_AMOUNT: "CENTS_INVALID_AMOUNT",
   CONVERSION_OVERFLOW: "CENTS_CONVERSION_OVERFLOW",
   SUM_MISMATCH: "CENTS_SUM_MISMATCH",
-  INVALID_MULTIPLIER: "OVERFLOW_INVALID_MULTIPLIER",
-  PRODUCT_OVERFLOW: "OVERFLOW_PRODUCT_EXCEEDED",
-  INVALID_DIVISOR: "OVERFLOW_INVALID_DIVISOR",
-  DIVISION_BY_ZERO: "OVERFLOW_DIVISION_BY_ZERO",
-  INVALID_ROUNDING_MODE: "INVALID_ROUNDING_MODE",
+  INVALID_MULTIPLIER: "CENTS_INVALID_MULTIPLIER",
+  PRODUCT_OVERFLOW: "CENTS_PRODUCT_OVERFLOW",
 } as const;
 
 export type CentsErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
@@ -329,150 +326,106 @@ export function validateSplitSum(
   return { ok: true, value: total };
 }
 
-/**
- * Perform deterministic integer division and apply rounding policy on the remainder.
- * Banker's rounding (round-to-nearest-even) breaks exact half ties to the nearest even integer.
- */
-function roundIntegerDivision(
-  numerator: bigint,
-  divisor: bigint,
-  mode: RoundingPolicy
-): bigint {
-  let N = numerator;
-  let D = divisor;
+// ---------------------------------------------------------------------------
+// Cents multiplier with overflow guards (#476)
+// ---------------------------------------------------------------------------
+//
+// The dollars/cents helpers above convert between representations. These apply
+// an arbitrary integer multiplier to an amount already in cents, rejecting a
+// product that would outgrow MAX_SAFE_DIGITS before it is returned.
+//
+// Unlike validateCentsAmount, a multiplier may be negative -- a reversal or a
+// debit adjustment is a legitimate factor -- so this path parses signed input.
 
-  if (D < 0n) {
-    N = -N;
-    D = -D;
-  }
+function parseSignedInteger(
+  input: string | number | bigint,
+  label: string,
+  invalidCode: CentsErrorCode
+): ConversionResult {
+  let raw: string;
 
-  const q = N / D;
-  const r = N % D;
-
-  if (r === 0n) {
-    return q;
-  }
-
-  const sign = N >= 0n ? 1n : -1n;
-  const absR = r >= 0n ? r : -r;
-  const twiceR = 2n * absR;
-
-  if (mode === "truncate") {
-    return q;
-  }
-
-  if (mode === "ceil") {
-    return N > 0n ? q + 1n : q;
-  }
-
-  if (mode === "half-up") {
-    if (twiceR >= D) {
-      return q + sign;
+  if (typeof input === "bigint") {
+    raw = input.toString();
+  } else if (typeof input === "number") {
+    if (!Number.isFinite(input) || !Number.isInteger(input)) {
+      return {
+        ok: false,
+        error: `${label} must be a finite integer`,
+        code: invalidCode,
+      };
     }
-    return q;
-  }
-
-  // mode is "half-even" or "round-to-nearest-even" (default)
-  // Tie-breaking rule for Banker's Rounding / Round-to-Nearest-Even:
-  // - If twice the remainder is strictly less than divisor: round towards 0 (keep q).
-  // - If twice the remainder is strictly greater than divisor: round away from 0 (q + sign).
-  // - If twice the remainder equals divisor (exact half):
-  //     - If q is even (q % 2n === 0n): keep q.
-  //     - If q is odd (q % 2n !== 0n): round to nearest even (q + sign).
-  if (twiceR < D) {
-    return q;
-  } else if (twiceR > D) {
-    return q + sign;
+    raw = String(input);
   } else {
-    // Exact halfway tie
-    if (q % 2n === 0n) {
-      return q;
-    } else {
-      return q + sign;
-    }
-  }
-}
-
-/**
- * Multiply stablecoin cents amount by multiplier and optional divisor after validating operands.
- * Applies rounding policy (default: round-to-nearest-even) when division remainders occur.
- */
-export function applyStablecoinCentsMultiplier(
-  amount: string | number | bigint,
-  multiplier: string | number | bigint,
-  divisorOrOptions?: string | number | bigint | ApplyMultiplierOptions,
-  roundingModeParam?: RoundingPolicy
-): ValidationResult {
-  const centsResult = validateStablecoinCents(amount);
-  if (!centsResult.ok) {
-    return centsResult;
-  }
-
-  const multiplierResult = validateMultiplier(multiplier);
-  if (!multiplierResult.ok) {
-    return multiplierResult;
-  }
-
-  let divisorInput: string | number | bigint = 1n;
-  let mode: RoundingPolicy = roundingModeParam ?? "half-even";
-
-  if (divisorOrOptions !== undefined && divisorOrOptions !== null) {
-    if (
-      typeof divisorOrOptions === "object" &&
-      typeof divisorOrOptions !== "bigint"
-    ) {
-      if (divisorOrOptions.divisor !== undefined) {
-        divisorInput = divisorOrOptions.divisor;
-      }
-      if (divisorOrOptions.roundingMode !== undefined) {
-        mode = divisorOrOptions.roundingMode;
-      }
-    } else {
-      divisorInput = divisorOrOptions;
+    raw = input.trim();
+    if (!/^-?\d+$/.test(raw)) {
+      return {
+        ok: false,
+        error: `${label} must be an integer numeric value`,
+        code: invalidCode,
+      };
     }
   }
 
-  const validModes: RoundingPolicy[] = [
-    "half-even",
-    "round-to-nearest-even",
-    "half-up",
-    "truncate",
-    "ceil",
-  ];
-  if (!validModes.includes(mode)) {
+  if (digitCount(raw) > MAX_SAFE_DIGITS) {
     return {
       ok: false,
-      error: `Invalid rounding mode: ${String(mode)}`,
-      code: ERROR_CODES.INVALID_ROUNDING_MODE,
+      error: `${label} exceeds maximum of ${MAX_SAFE_DIGITS} digits`,
+      code: ERROR_CODES.EXCESSIVE_DIGITS,
     };
   }
 
-  const divisorResult = validateDivisor(divisorInput);
-  if (!divisorResult.ok) {
-    return divisorResult;
+  return { ok: true, value: BigInt(raw) };
+}
+
+/**
+ * Validate a cents multiplier against digit limits.
+ */
+export function validateMultiplier(
+  multiplier: string | number | bigint
+): ConversionResult {
+  return parseSignedInteger(
+    multiplier,
+    "multiplier",
+    ERROR_CODES.INVALID_MULTIPLIER
+  );
+}
+
+/** Alias for validateMultiplier. */
+export const validateCentsMultiplier = validateMultiplier;
+
+/**
+ * Multiply a stablecoin cents amount by a multiplier factor after validating
+ * both operands, and reject a product that exceeds the safe digit limit.
+ */
+export function applyCentsMultiplier(
+  amount: string | number | bigint,
+  multiplier: string | number | bigint
+): ConversionResult {
+  const amountCheck = parseSignedInteger(
+    amount,
+    "amount",
+    ERROR_CODES.INVALID_MULTIPLIER
+  );
+  if (!amountCheck.ok) {
+    return amountCheck;
   }
 
-  const product = centsResult.value * multiplierResult.value;
+  const factor = validateMultiplier(multiplier);
+  if (!factor.ok) {
+    return factor;
+  }
+
+  const product = amountCheck.value * factor.value;
   if (digitCount(product.toString()) > MAX_SAFE_DIGITS) {
     return {
       ok: false,
-      error: `multiplied cents value exceeds maximum of ${MAX_SAFE_DIGITS} digits`,
+      error: `multiplied value exceeds maximum of ${MAX_SAFE_DIGITS} digits`,
       code: ERROR_CODES.PRODUCT_OVERFLOW,
     };
   }
 
-  const finalValue = roundIntegerDivision(product, divisorResult.value, mode);
-  if (digitCount(finalValue.toString()) > MAX_SAFE_DIGITS) {
-    return {
-      ok: false,
-      error: `multiplied cents value exceeds maximum of ${MAX_SAFE_DIGITS} digits`,
-      code: ERROR_CODES.PRODUCT_OVERFLOW,
-    };
-  }
-
-  return { ok: true, value: finalValue };
+  return { ok: true, value: product };
 }
 
-/** Aliases for backward compatibility */
-export const applyCentsMultiplier = applyStablecoinCentsMultiplier;
-export const multiplyStablecoinCents = applyStablecoinCentsMultiplier;
+/** Alias for applyCentsMultiplier. */
+export const multiplyStablecoinCents = applyCentsMultiplier;
