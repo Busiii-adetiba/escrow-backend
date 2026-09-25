@@ -25,7 +25,6 @@ export const ERROR_CODES = {
   INVALID_SHARES: "FEE_CALCULATOR_INVALID_SHARES",
   CALCULATION_OVERFLOW: "FEE_CALCULATOR_OVERFLOW",
   FEE_EXCEEDS_AMOUNT: "FEE_CALCULATOR_FEE_EXCEEDS_AMOUNT",
-  RATE_LIMITED: "FEE_CALCULATOR_RATE_LIMITED",
   // Compatibility aliases
   OVERFLOW_EXCESSIVE_DIGITS: "OVERFLOW_EXCESSIVE_DIGITS",
   OVERFLOW_INVALID_AMOUNT: "OVERFLOW_INVALID_AMOUNT",
@@ -82,43 +81,6 @@ export type FeeShareCheckOutcome =
 function digitCount(normalized: string): number {
   const digits = normalized.replace(/^-/, "").replace(/^0+(?=\d)/, "");
   return digits.length === 0 ? 1 : digits.length;
-}
-
-/** Max calculator calls allowed per rate-limit window before calls are rejected. */
-export const RATE_LIMIT_MAX_CALLS = 1000;
-
-/** Rate-limit window size, in milliseconds. */
-export const RATE_LIMIT_WINDOW_MS = 60_000;
-
-let rateLimitWindowStart = Date.now();
-let rateLimitCallCount = 0;
-
-/**
- * Guard against excessive fee-calculation call volume within a rolling
- * window. This module has no HTTP route of its own, so callers get the
- * same 429-style rejection semantics used by the app's request-level rate
- * limiters, scoped to this module's own call volume instead of a client IP.
- */
-function checkFeeCalculatorRateLimit():
-  | { ok: true }
-  | { ok: false; error: string; code: FeeCalculatorErrorCode } {
-  const now = Date.now();
-  if (now - rateLimitWindowStart >= RATE_LIMIT_WINDOW_MS) {
-    rateLimitWindowStart = now;
-    rateLimitCallCount = 0;
-  }
-
-  rateLimitCallCount += 1;
-
-  if (rateLimitCallCount > RATE_LIMIT_MAX_CALLS) {
-    return {
-      ok: false,
-      error: `fee calculator rate limit exceeded: max ${RATE_LIMIT_MAX_CALLS} calls per ${RATE_LIMIT_WINDOW_MS}ms`,
-      code: ERROR_CODES.RATE_LIMITED,
-    };
-  }
-
-  return { ok: true };
 }
 
 /**
@@ -266,11 +228,6 @@ export function calculateFeeDeduction(
   feeRate: string | number | bigint,
   scale: string | number | bigint = DEFAULT_FEE_SCALE
 ): FeeDeductionOutcome {
-  const rateLimitCheck = checkFeeCalculatorRateLimit();
-  if (!rateLimitCheck.ok) {
-    return rateLimitCheck;
-  }
-
   const grossCheck = validateAmount(grossAmount, "grossAmount");
   if (!grossCheck.ok) {
     return grossCheck;
@@ -343,11 +300,6 @@ export function calculateFeeShares(
   totalFee: string | number | bigint,
   shares: number[]
 ): FeeShareOutcome {
-  const rateLimitCheck = checkFeeCalculatorRateLimit();
-  if (!rateLimitCheck.ok) {
-    return rateLimitCheck;
-  }
-
   const totalCheck = validateAmount(totalFee, "totalFee");
   if (!totalCheck.ok) {
     return totalCheck;
@@ -416,11 +368,6 @@ export function calculateFeeShareDeductions(
   grossAmount: string | number | bigint,
   shares: number[]
 ): FeeShareDeductionOutcome {
-  const rateLimitCheck = checkFeeCalculatorRateLimit();
-  if (!rateLimitCheck.ok) {
-    return rateLimitCheck;
-  }
-
   const grossCheck = validateAmount(grossAmount, "grossAmount");
   if (!grossCheck.ok) {
     return grossCheck;
@@ -507,13 +454,6 @@ export function checkFeeShareCalculation(
   if (!grossCheck.ok) {
     return grossCheck;
   }
-  if (grossCheck.value < 0n) {
-    return {
-      ok: false,
-      error: "grossAmount must be non-negative",
-      code: ERROR_CODES.INVALID_AMOUNT,
-    };
-  }
 
   let totalFee = 0n;
 
@@ -521,13 +461,6 @@ export function checkFeeShareCalculation(
     const shareCheck = validateAmount(feeShares[i], `feeShares[${i}]`);
     if (!shareCheck.ok) {
       return shareCheck;
-    }
-    if (shareCheck.value < 0n) {
-      return {
-        ok: false,
-        error: `feeShares[${i}] must be non-negative`,
-        code: ERROR_CODES.INVALID_AMOUNT,
-      };
     }
 
     const next = totalFee + shareCheck.value;
@@ -555,13 +488,6 @@ export function checkFeeShareCalculation(
     const expectedCheck = validateAmount(expectedTotalFee, "expectedTotalFee");
     if (!expectedCheck.ok) {
       return expectedCheck;
-    }
-    if (expectedCheck.value < 0n) {
-      return {
-        ok: false,
-        error: "expectedTotalFee must be non-negative",
-        code: ERROR_CODES.INVALID_AMOUNT,
-      };
     }
     isValid = totalFee === expectedCheck.value;
   }
@@ -691,11 +617,6 @@ export function calculateFeeDeductionHalfEven(
   baseAmount: string | number | bigint,
   feeRateBps: number
 ): FeeDeductionHalfEvenOutcome {
-  const rateLimitCheck = checkFeeCalculatorRateLimit();
-  if (!rateLimitCheck.ok) {
-    return rateLimitCheck;
-  }
-
   const base = validateBaseAmount(baseAmount);
   if (!base.ok) {
     return base;
@@ -721,115 +642,4 @@ export function calculateFeeDeductionHalfEven(
   const netAmount = base.value - feeAmount;
 
   return { ok: true, feeAmount, netAmount };
-}
-
-// ---------------------------------------------------------------------------
-// DB storage formatting (#433)
-// ---------------------------------------------------------------------------
-//
-// Calculated amounts are bigints internally, but rows written to a DB
-// precision column need a fixed-width decimal string: unlike a human display
-// format, trailing zeros are kept (not trimmed) so every row has the same
-// number of fractional digits matching the column's declared precision.
-
-/** Default decimal precision (Stellar classic/SAC asset precision) used when no explicit precision is given. */
-export const DEFAULT_DB_DECIMALS = 7;
-
-export type DbAmountFormatResult =
-  | { ok: true; value: string }
-  | { ok: false; error: string; code: FeeCalculatorErrorCode };
-
-/**
- * Format a raw bigint amount as a fixed-precision decimal string suitable
- * for writing to a DB column with a fixed number of fractional digits.
- * Uses string arithmetic throughout so no precision is lost the way it
- * would be by round-tripping the amount through a JS number/float column.
- */
-export function formatAmountForStorage(
-  amount: string | number | bigint,
-  decimals: number = DEFAULT_DB_DECIMALS
-): DbAmountFormatResult {
-  const amountCheck = validateAmount(amount, "amount");
-  if (!amountCheck.ok) {
-    return amountCheck;
-  }
-
-  if (
-    typeof decimals !== "number" ||
-    !Number.isFinite(decimals) ||
-    !Number.isInteger(decimals) ||
-    decimals < 0
-  ) {
-    return {
-      ok: false,
-      error: "decimals must be a non-negative finite integer",
-      code: ERROR_CODES.INVALID_AMOUNT,
-    };
-  }
-
-  const value = amountCheck.value;
-  const negative = value < 0n;
-  const digits = (negative ? -value : value).toString();
-
-  if (decimals === 0) {
-    return { ok: true, value: `${negative ? "-" : ""}${digits}` };
-  }
-
-  const padded = digits.padStart(decimals + 1, "0");
-  const wholePart = padded.slice(0, padded.length - decimals);
-  const fractionalPart = padded.slice(padded.length - decimals);
-
-  return { ok: true, value: `${negative ? "-" : ""}${wholePart}.${fractionalPart}` };
-}
-
-// ---------------------------------------------------------------------------
-// Asset ticker format fallback (#432)
-// ---------------------------------------------------------------------------
-//
-// formatAmountForStorage() takes an explicit decimals precision. Callers that
-// only have a Stellar asset ticker (not a precision) resolve one through this
-// lookup instead, which falls back to DEFAULT_ASSET_FORMAT_CONFIG for any
-// ticker this module doesn't recognize rather than failing the calculation.
-
-export interface AssetFormatConfig {
-  ticker: string;
-  decimals: number;
-}
-
-/** Fallback format config applied when a ticker is missing or unrecognized. */
-export const DEFAULT_ASSET_FORMAT_CONFIG: AssetFormatConfig = {
-  ticker: "UNKNOWN",
-  decimals: DEFAULT_DB_DECIMALS,
-};
-
-/** Format configs for Stellar asset tickers with a known, non-default precision. */
-const KNOWN_ASSET_FORMATS: Record<string, AssetFormatConfig> = {
-  XLM: { ticker: "XLM", decimals: 7 },
-  USDC: { ticker: "USDC", decimals: 7 },
-};
-
-/**
- * Resolve the DB storage format config (decimal precision) for a Stellar
- * asset ticker, falling back to DEFAULT_ASSET_FORMAT_CONFIG for missing or
- * unrecognized tickers so callers always get a usable configuration.
- */
-export function getAssetFormatConfig(ticker?: string | null): AssetFormatConfig {
-  if (!ticker) {
-    return DEFAULT_ASSET_FORMAT_CONFIG;
-  }
-  const normalized = ticker.trim().toUpperCase();
-  return KNOWN_ASSET_FORMATS[normalized] ?? DEFAULT_ASSET_FORMAT_CONFIG;
-}
-
-/**
- * Format a raw bigint amount for DB storage using the precision configured
- * for the given asset ticker, falling back to DEFAULT_ASSET_FORMAT_CONFIG
- * when the ticker is missing or unrecognized.
- */
-export function formatAmountForStorageByTicker(
-  amount: string | number | bigint,
-  ticker?: string | null
-): DbAmountFormatResult {
-  const { decimals } = getAssetFormatConfig(ticker);
-  return formatAmountForStorage(amount, decimals);
 }
