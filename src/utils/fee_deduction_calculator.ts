@@ -141,7 +141,7 @@ export function validateAmount(
       };
     }
     raw = String(input);
-  } else {
+  } else if (typeof input === "string") {
     raw = input.trim();
     if (!/^-?\d+$/.test(raw)) {
       return {
@@ -150,6 +150,12 @@ export function validateAmount(
         code: ERROR_CODES.INVALID_AMOUNT,
       };
     }
+  } else {
+    return {
+      ok: false,
+      error: `${label} must be a string, number, or bigint`,
+      code: ERROR_CODES.INVALID_AMOUNT,
+    };
   }
 
   if (digitCount(raw) > MAX_SAFE_DIGITS) {
@@ -193,7 +199,7 @@ export function validateFeeRate(
       };
     }
     raw = String(input);
-  } else {
+  } else if (typeof input === "string") {
     raw = input.trim();
     if (!/^-?\d+$/.test(raw)) {
       return {
@@ -202,6 +208,12 @@ export function validateFeeRate(
         code: ERROR_CODES.INVALID_FEE_RATE,
       };
     }
+  } else {
+    return {
+      ok: false,
+      error: `${label} must be a string, number, or bigint`,
+      code: ERROR_CODES.INVALID_FEE_RATE,
+    };
   }
 
   if (digitCount(raw) > MAX_SAFE_DIGITS) {
@@ -615,14 +627,7 @@ export function validateBaseAmount(
       };
     }
     raw = String(input);
-  } else {
-    if (typeof input !== "string") {
-      return {
-        ok: false,
-        error: `${label} must be a string, number, or bigint`,
-        code: ERROR_CODES.INVALID_AMOUNT,
-      };
-    }
+  } else if (typeof input === "string") {
     raw = input.trim();
     if (!/^\d+$/.test(raw)) {
       return {
@@ -631,6 +636,12 @@ export function validateBaseAmount(
         code: ERROR_CODES.INVALID_AMOUNT,
       };
     }
+  } else {
+    return {
+      ok: false,
+      error: `${label} must be a string, number, or bigint`,
+      code: ERROR_CODES.INVALID_AMOUNT,
+    };
   }
 
   if (digitCount(raw) > MAX_SAFE_DIGITS) {
