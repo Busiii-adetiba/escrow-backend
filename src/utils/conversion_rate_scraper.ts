@@ -1,6 +1,6 @@
 /**
  * Oracle conversion-rate scraper helpers with overflow / digit-limit validation,
- * and round-half-to-even rounding for division remainders.
+ * round-half-to-even rounding, and unknown asset ticker fallbacks.
  *
  * ## Design notes
  *
@@ -14,6 +14,12 @@
  * digit. This eliminates the systematic upward bias produced by the more
  * common "round half up" rule and is consistent with IEEE 754 default rounding
  * and the approach used by `fee_deduction_calculator`.
+ *
+ * ### Unknown tickers
+ * `resolveAssetTicker` returns a `TickerResolution` that always succeeds —
+ * unknown tickers produce a `{ known: false }` fallback instead of throwing.
+ * Callers can inspect the `known` flag and decide whether to proceed, reject,
+ * or emit a warning without crashing the scraper.
  */
 
 /** Max decimal digits allowed for a conversion rate or notional (below Number.MAX_SAFE_INTEGER). */
@@ -189,4 +195,80 @@ export function scaleWithRounding(
     throw new RangeError("scaleWithRounding: scaleDenominator must not be zero");
   }
   return divideRoundHalfEven(value * scaleNumerator, scaleDenominator);
+}
+
+// ---------------------------------------------------------------------------
+// Unknown asset ticker fallbacks
+// ---------------------------------------------------------------------------
+
+/**
+ * Well-known Stellar asset tickers with their decimal precision (stroops/units)
+ * and a human-readable label.
+ */
+export interface KnownAssetConfig {
+  /** Ticker symbol (e.g. "XLM", "USDC") */
+  ticker: string;
+  /**
+   * Number of decimal places the asset uses.
+   * XLM uses 7 (1 XLM = 10^7 stroops); most Stellar tokens use 7.
+   */
+  decimals: number;
+  /** Human-readable asset name */
+  label: string;
+}
+
+const KNOWN_ASSETS: Record<string, KnownAssetConfig> = {
+  XLM:  { ticker: "XLM",  decimals: 7, label: "Stellar Lumens" },
+  USDC: { ticker: "USDC", decimals: 7, label: "USD Coin (Stellar)" },
+  USDT: { ticker: "USDT", decimals: 7, label: "Tether (Stellar)" },
+  BTC:  { ticker: "BTC",  decimals: 7, label: "Bitcoin (Stellar)" },
+  ETH:  { ticker: "ETH",  decimals: 7, label: "Ether (Stellar)" },
+};
+
+/**
+ * Result of a ticker resolution. Callers must inspect `known` before relying
+ * on `config` — an unknown ticker always carries the default fallback config.
+ */
+export type TickerResolution =
+  | { known: true;  ticker: string; config: KnownAssetConfig }
+  | { known: false; ticker: string; config: KnownAssetConfig; fallback: true };
+
+/**
+ * Default fallback configuration used for any ticker not present in
+ * `KNOWN_ASSETS`. Uses 7 decimal places (Stellar-native precision) so that
+ * downstream formatters produce a valid DB value even for novel token types.
+ */
+export const DEFAULT_ASSET_FALLBACK: KnownAssetConfig = {
+  ticker: "UNKNOWN",
+  decimals: 7,
+  label: "Unknown Stellar Token",
+};
+
+/**
+ * Resolve an asset ticker string to its configuration, returning a typed
+ * fallback for any ticker not found in the registry.
+ *
+ * This function **never throws**. Callers receive either:
+ * - `{ known: true, config }` — a recognised ticker with its full config, or
+ * - `{ known: false, config, fallback: true }` — an unrecognised ticker with
+ *   the default fallback config, so the scraper can continue safely.
+ *
+ * @example
+ * resolveAssetTicker("XLM")       // { known: true,  ticker: "XLM",     config: { decimals: 7, … } }
+ * resolveAssetTicker("NOVEL_TOK") // { known: false, ticker: "NOVEL_TOK", config: DEFAULT_ASSET_FALLBACK, fallback: true }
+ */
+export function resolveAssetTicker(rawTicker: string): TickerResolution {
+  const ticker = rawTicker.trim().toUpperCase();
+  const config = KNOWN_ASSETS[ticker];
+
+  if (config !== undefined) {
+    return { known: true, ticker, config };
+  }
+
+  return {
+    known: false,
+    ticker: rawTicker.trim(),
+    config: { ...DEFAULT_ASSET_FALLBACK, ticker: rawTicker.trim() },
+    fallback: true,
+  };
 }
