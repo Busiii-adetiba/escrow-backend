@@ -33,6 +33,7 @@ export const ERROR_CODES = {
   ALLOCATION_OVERFLOW: "ALLOCATOR_OVERFLOW",
   NEGATIVE_AMOUNT: "ALLOCATOR_NEGATIVE_AMOUNT",
   UNKNOWN_TICKER: "ALLOCATOR_UNKNOWN_TICKER",
+  SUM_MISMATCH: "ALLOCATOR_SUM_MISMATCH",
 } as const;
 
 export type OverflowErrorCode =
@@ -260,4 +261,38 @@ export function allocatePartialPaymentWithTicker(
     ticker: ticker.toUpperCase(),
     decimals: tokenCheck.value.decimals,
   };
+}
+
+/**
+ * Confirm that a set of split payment amounts sums exactly to the given base
+ * total amount, rejecting allocations that over- or under-allocate the total.
+ */
+export function validateAllocationSum(
+  parts: Array<string | number | bigint>,
+  baseAmount: string | number | bigint
+): ValidationResult {
+  let total = 0n;
+
+  for (let i = 0; i < parts.length; i++) {
+    const checked = validatePaymentAmount(parts[i], `parts[${i}]`);
+    if (!checked.ok) {
+      return checked;
+    }
+    total += checked.value;
+  }
+
+  const baseCheck = validatePaymentAmount(baseAmount, "baseAmount");
+  if (!baseCheck.ok) {
+    return baseCheck;
+  }
+
+  if (total !== baseCheck.value) {
+    return {
+      ok: false,
+      error: `split total (${total}) does not match base amount (${baseCheck.value})`,
+      code: ERROR_CODES.SUM_MISMATCH,
+    };
+  }
+
+  return { ok: true, value: total };
 }
