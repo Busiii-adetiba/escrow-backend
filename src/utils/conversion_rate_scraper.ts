@@ -1,6 +1,7 @@
 /**
  * Oracle conversion-rate scraper helpers with overflow / digit-limit validation,
- * round-half-to-even rounding, and unknown asset ticker fallbacks.
+ * round-half-to-even rounding, unknown asset ticker fallbacks, and DB-column
+ * precision formatting.
  *
  * ## Design notes
  *
@@ -20,6 +21,13 @@
  * unknown tickers produce a `{ known: false }` fallback instead of throwing.
  * Callers can inspect the `known` flag and decide whether to proceed, reject,
  * or emit a warning without crashing the scraper.
+ *
+ * ### DB precision formatting
+ * `formatRateForDb` and `formatNotionalForDb` convert bigint values to decimal
+ * strings with a configurable number of decimal places so that values stored in
+ * `data_json` always match the precision schema expected by downstream queries
+ * (e.g. 7 decimal places for Stellar stroops / XLM rates). The scale factor is
+ * explicit so the formatter is stateless and trivially testable.
  */
 
 /** Max decimal digits allowed for a conversion rate or notional (below Number.MAX_SAFE_INTEGER). */
@@ -271,4 +279,84 @@ export function resolveAssetTicker(rawTicker: string): TickerResolution {
     config: { ...DEFAULT_ASSET_FALLBACK, ticker: rawTicker.trim() },
     fallback: true,
   };
+}
+
+// ---------------------------------------------------------------------------
+// DB-column precision formatting
+// ---------------------------------------------------------------------------
+
+/**
+ * Format a bigint `value` as a decimal string with exactly `decimals` places,
+ * suitable for storage in `data_json` columns that downstream queries expect
+ * to have a fixed number of fractional digits.
+ *
+ * The `value` is the **already-scaled** integer representation
+ * (e.g. stroops for XLM). `decimals` is the number of decimal places to
+ * restore (e.g. 7 for XLM so 10_000_000n → "1.0000000").
+ *
+ * Negative values are handled correctly: the minus sign is preserved.
+ *
+ * @example
+ * formatForDb(10_000_000n, 7)   // "1.0000000"
+ * formatForDb(12_345_678n, 7)   // "1.2345678"
+ * formatForDb(1n, 7)            // "0.0000001"
+ * formatForDb(-5_000_000n, 7)   // "-0.5000000"
+ * formatForDb(100n, 0)          // "100"
+ */
+export function formatForDb(value: bigint, decimals: number): string {
+  if (!Number.isInteger(decimals) || decimals < 0) {
+    throw new RangeError(
+      `formatForDb: decimals must be a non-negative integer, got ${decimals}`
+    );
+  }
+
+  if (decimals === 0) {
+    return value.toString();
+  }
+
+  const isNegative = value < 0n;
+  const abs = isNegative ? -value : value;
+  const scale = 10n ** BigInt(decimals);
+
+  const integerPart = abs / scale;
+  const fractionalPart = abs % scale;
+
+  // Pad fractional part with leading zeros to `decimals` width
+  const fracStr = fractionalPart.toString().padStart(decimals, "0");
+  const formatted = `${integerPart.toString()}.${fracStr}`;
+
+  return isNegative ? `-${formatted}` : formatted;
+}
+
+/**
+ * Format a conversion rate bigint for DB storage with the precision specified
+ * by the asset's ticker configuration.
+ *
+ * Resolves the ticker first (unknown tickers receive the default 7-decimal
+ * fallback) and then delegates to `formatForDb`.
+ *
+ * @example
+ * formatRateForDb(12_345_678n, "XLM")  // "1.2345678"
+ * formatRateForDb(10_000_000n, "USDC") // "1.0000000"
+ * formatRateForDb(5_000_000n, "???")   // "0.5000000"  (fallback: 7 decimals)
+ */
+export function formatRateForDb(rate: bigint, ticker: string): string {
+  const resolution = resolveAssetTicker(ticker);
+  return formatForDb(rate, resolution.config.decimals);
+}
+
+/**
+ * Format a notional amount bigint for DB storage with the precision specified
+ * by the asset's ticker configuration.
+ *
+ * Identical to `formatRateForDb` except the label in the resolution step
+ * represents the notional asset rather than the rate asset — useful when the
+ * two assets differ.
+ *
+ * @example
+ * formatNotionalForDb(100_000_000n, "USDC") // "10.0000000"
+ */
+export function formatNotionalForDb(notional: bigint, ticker: string): string {
+  const resolution = resolveAssetTicker(ticker);
+  return formatForDb(notional, resolution.config.decimals);
 }
